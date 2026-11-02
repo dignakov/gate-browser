@@ -1,0 +1,27 @@
+[package]
+name = "gate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gate"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+layout.workspace = true
+web.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-segmentation = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+sha2 = "0.10"
+ureq = { version = "3", features = ["json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

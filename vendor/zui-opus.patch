@@ -1,0 +1,301 @@
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index ccad65ac48..eb12071c3e 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2344,8 +2344,10 @@ impl Interactivity {
+                 window.with_element_opacity(style.opacity, |window| {
+                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                         window.with_text_style(style.text_style().cloned(), |window| {
+-                            window.with_content_mask(
++                            // Children are clipped to the rounded corners too.
++                            window.with_overflow_clip(
+                                 style.overflow_mask(bounds, window.rem_size()),
++                                style.overflow_clip_radius(bounds, window.rem_size()),
+                                 |window| {
+                                     window.with_tab_group(tab_group, |window| {
+                                         // Register the container's own focus handle *inside* its
+diff --git a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
+index 0908a7ea4d..f970b09de1 100644
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -629,6 +629,29 @@ impl Style {
+         }
+     }
+ 
++    /// The corner radius to clip children to, as CSS's `overflow: hidden`
++    /// clips to `border-radius`: for an element hiding overflow on both axes
++    /// with one radius on all four corners (inside its border). `None`
++    /// means a rectangular clip suffices.
++    pub fn overflow_clip_radius(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Option<Pixels> {
++        if self.overflow.x == Overflow::Visible || self.overflow.y == Overflow::Visible {
++            return None;
++        }
++        let r = self.corner_radii.map(|r| r.to_pixels(rem_size));
++        if r.top_left != r.top_right || r.top_left != r.bottom_left || r.top_left != r.bottom_right {
++            return None;
++        }
++        let border = if self.border_color.is_some_and(|color| !color.is_transparent()) {
++            let w = &self.border_widths;
++            [w.left, w.right, w.top, w.bottom].iter().map(|w| w.to_pixels(rem_size)).fold(Pixels::ZERO, |a, b| a.max(b))
++        } else {
++            Pixels::ZERO
++        };
++        let half = bounds.size.width.min(bounds.size.height) / 2.0;
++        let radius = (r.top_left.min(half) - border).max(Pixels::ZERO);
++        (radius > Pixels::ZERO).then_some(radius)
++    }
++
+     /// Get the content mask for this element style, based on the given bounds.
+     /// If the element does not hide its overflow, this will return `None`.
+     pub fn overflow_mask(
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 60457ade49..614e38359a 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1070,6 +1070,8 @@ pub struct Window {
+     sprite_atlas: Arc<dyn PlatformAtlas>,
+     text_system: Arc<WindowTextSystem>,
+     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
++    /// Set by [`Window::set_opaque_content`].
++    opaque_content: bool,
+     rem_size: Pixels,
+     /// The stack of override values for the window's rem size.
+     ///
+@@ -1804,6 +1806,7 @@ impl Window {
+             sprite_atlas,
+             text_system,
+             text_rendering_mode: cx.text_rendering_mode.clone(),
++            opaque_content: false,
+             rem_size: px(16.),
+             rem_size_override_stack: SmallVec::new(),
+             viewport_size: content_size,
+@@ -2531,6 +2534,16 @@ impl Window {
+         self.platform_window.set_app_id(app_id);
+     }
+ 
++    /// Declares that, though the window's background is transparent (for
++    /// rounded corners, say), everything text is drawn on is opaque. Subpixel
++    /// text then stays on: its blending is exact over opaque pixels (alpha
++    /// stays 1); only text over see-through pixels needs grayscale, and the
++    /// window promises it draws none.
++    pub fn set_opaque_content(&mut self, opaque: bool) {
++        self.opaque_content = opaque;
++        self.refresh();
++    }
++
+     /// Sets the window background appearance.
+     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
+         self.platform_window
+@@ -3799,6 +3812,21 @@ impl Window {
+         result
+     }
+ 
++    /// Clips to `mask` (if any), with rounded corners when `radius` is
++    /// given: what an element hiding its overflow applies to its children
++    /// (see [`crate::Style::overflow_clip_radius`]).
++    pub fn with_overflow_clip<R>(
++        &mut self,
++        mask: Option<ContentMask<Pixels>>,
++        radius: Option<Pixels>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        match (mask, radius) {
++            (Some(mask), Some(radius)) => self.with_rounded_clip(mask.bounds, radius, f),
++            (mask, _) => self.with_content_mask(mask, f),
++        }
++    }
++
+     /// Obtain the current content mask. This method should only be called during element drawing.
+     pub fn content_mask(&self) -> ContentMask<Pixels> {
+         self.invalidator.debug_assert_paint_or_prepaint();
+@@ -4451,7 +4479,7 @@ impl Window {
+     }
+ 
+     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
++        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque && !self.opaque_content {
+             return false;
+         }
+ 
+diff --git a/crates/gpui_linux/src/linux/platform.rs b/crates/gpui_linux/src/linux/platform.rs
+index 876f931663..5c17a38556 100644
+--- a/crates/gpui_linux/src/linux/platform.rs
++++ b/crates/gpui_linux/src/linux/platform.rs
+@@ -122,6 +122,9 @@ pub(crate) struct LinuxCommon {
+     pub(crate) button_layout: WindowButtonLayout,
+     pub(crate) callbacks: PlatformHandlers,
+     pub(crate) signal: LoopSignal,
++    /// Set by `quit`. The event loop's own stop flag is reset when the loop
++    /// starts, so a quit asked for while launching would otherwise be lost.
++    quitting: bool,
+     pub(crate) menus: Vec<OwnedMenu>,
+     app_name: Option<String>,
+     system_notifications: crate::linux::system_notifications::SystemNotificationState,
+@@ -164,6 +167,7 @@ impl LinuxCommon {
+             button_layout: WindowButtonLayout::linux_default(),
+             callbacks,
+             signal,
++            quitting: false,
+             menus: Vec::new(),
+             app_name: None,
+             system_notifications: crate::linux::system_notifications::SystemNotificationState::new(
+@@ -265,7 +269,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
+     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+         on_finish_launching();
+ 
+-        LinuxClient::run(&self.inner);
++        // Quit while launching: there is no loop to stop yet, so don't start one.
++        if !self.inner.with_common(|common| common.quitting) {
++            LinuxClient::run(&self.inner);
++        }
+ 
+         let quit = self
+             .inner
+@@ -276,7 +283,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
+     }
+ 
+     fn quit(&self) {
+-        self.inner.with_common(|common| common.signal.stop());
++        self.inner.with_common(|common| {
++            common.quitting = true;
++            common.signal.stop();
++        });
+     }
+ 
+     fn compositor_name(&self) -> &'static str {
+diff --git a/crates/gpui_wgpu/src/wgpu_context.rs b/crates/gpui_wgpu/src/wgpu_context.rs
+index 0253fa3..fa7930d 100644
+--- a/crates/gpui_wgpu/src/wgpu_context.rs
++++ b/crates/gpui_wgpu/src/wgpu_context.rs
+@@ -42,7 +42,7 @@ impl WgpuContext {
+     }
+ 
+     #[cfg(not(target_family = "wasm"))]
+-    fn new_with_options(
++    pub(crate) fn new_with_options(
+         instance: wgpu::Instance,
+         surface: &wgpu::Surface<'_>,
+         compositor_gpu: Option<CompositorGpuHint>,
+@@ -188,10 +188,15 @@ impl WgpuContext {
+         ))
+     }
+ 
++    /// An instance offering `backends`. Native renderers ask for Vulkan
++    /// first and GL only if Vulkan can't draw to the window (see
++    /// `WgpuRenderer`'s `create_context`): just enumerating GL starts EGL,
++    /// which on some drivers (NVIDIA's, with Mesa's EGL beside it) prints
++    /// warnings and costs startup time for nothing.
+     #[cfg(not(target_family = "wasm"))]
+-    pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
++    pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>, backends: wgpu::Backends) -> wgpu::Instance {
+         wgpu::Instance::new(wgpu::InstanceDescriptor {
+-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
++            backends,
+             flags: wgpu::InstanceFlags::default(),
+             backend_options: wgpu::BackendOptions::default(),
+             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index caec6db..2aa8ddb 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -281,37 +281,22 @@ impl WgpuRenderer {
+             .window_handle()
+             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+ 
+-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+-            // Fall back to the display handle already provided via InstanceDescriptor::display.
+-            raw_display_handle: None,
+-            raw_window_handle: window_handle.as_raw(),
+-        };
+-
+-        // Use the existing context's instance if available, otherwise create a new one.
+-        // The surface must be created with the same instance that will be used for
+-        // adapter selection, otherwise wgpu will panic.
+-        let instance = gpu_context
+-            .borrow()
+-            .as_ref()
+-            .map(|ctx| ctx.instance.clone())
+-            .unwrap_or_else(|| WgpuContext::instance(Box::new(window.clone())));
+-
+-        // Safety: The caller guarantees that the window handle is valid for the
+-        // lifetime of this renderer. In practice, the RawWindow struct is created
+-        // from the native window handles and the surface is dropped before the window.
+-        let surface = unsafe {
+-            instance
+-                .create_surface_unsafe(target)
+-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
+-        };
+-
++        // The surface must come from the instance that selects the adapter,
++        // otherwise wgpu panics: an existing context's, or a new one's.
++        // Safety (surfaces): the caller guarantees the window handle stays
++        // valid for this renderer's lifetime; the surface is dropped first.
+         let mut ctx_ref = gpu_context.borrow_mut();
+-        let context = match ctx_ref.as_mut() {
++        let (context, surface) = match ctx_ref.as_mut() {
+             Some(context) => {
++                let surface = create_surface(&context.instance, window_handle.as_raw())
++                    .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?;
+                 context.check_compatible_with_surface(&surface)?;
+-                context
++                (context, surface)
++            }
++            None => {
++                let (context, surface) = create_context(window, window_handle.as_raw(), compositor_gpu, false)?;
++                (ctx_ref.insert(context), surface)
+             }
+-            None => ctx_ref.insert(WgpuContext::new(instance, &surface, compositor_gpu)?),
+         };
+ 
+         let atlas = Arc::new(WgpuAtlas::from_context(context));
+@@ -2597,10 +2582,8 @@ impl WgpuRenderer {
+             // may need more time to come back (e.g. after suspend/resume).
+             std::thread::sleep(std::time::Duration::from_millis(350));
+ 
+-            let instance = WgpuContext::instance(Box::new(window.clone()));
+-            let surface = create_surface(&instance, window_handle.as_raw())?;
+-            let new_context =
+-                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
++            let (new_context, surface) =
++                create_context(window, window_handle.as_raw(), self.compositor_gpu, true)?;
+             *gpu_context.borrow_mut() = Some(new_context);
+             surface
+         } else {
+@@ -2639,6 +2622,37 @@ impl WgpuRenderer {
+ }
+ 
+ #[cfg(not(target_family = "wasm"))]
++/// A GPU context and the window's surface on it: Vulkan when it has a GPU
++/// that can draw to the window, else GL (which isn't even probed otherwise;
++/// see [`WgpuContext::instance`]).
++#[cfg(not(target_family = "wasm"))]
++fn create_context<W>(
++    window: &W,
++    raw_window_handle: raw_window_handle::RawWindowHandle,
++    compositor_gpu: Option<CompositorGpuHint>,
++    reject_software: bool,
++) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)>
++where
++    W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
++{
++    let mut failure = None;
++    for backends in [wgpu::Backends::VULKAN, wgpu::Backends::GL] {
++        let instance = WgpuContext::instance(Box::new(window.clone()), backends);
++        let attempt = create_surface(&instance, raw_window_handle).and_then(|surface| {
++            let context = WgpuContext::new_with_options(instance, &surface, compositor_gpu, reject_software)?;
++            Ok((context, surface))
++        });
++        match attempt {
++            Ok(found) => return Ok(found),
++            Err(error) => {
++                log::info!("no usable {backends:?} GPU: {error:#}");
++                failure = Some(error);
++            }
++        }
++    }
++    Err(failure.expect("tried at least one backend"))
++}
++
+ fn create_surface(
+     instance: &wgpu::Instance,
+     raw_window_handle: raw_window_handle::RawWindowHandle,
