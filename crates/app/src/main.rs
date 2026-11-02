@@ -1,3 +1,6 @@
+// Release builds on Windows open no console window beside Gate's.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 //! Gate: a Chromium browser with a sidebar of tabs, herdr-style
 //! splits and zeron's look.
 
@@ -151,16 +154,30 @@ fn main() {
     });
 }
 
-/// Cookies, cache and storage: `$XDG_DATA_HOME/gate`.
+/// Cookies, cache and storage: `%LOCALAPPDATA%\Gate` on Windows,
+/// `$XDG_DATA_HOME/gate` elsewhere.
 fn profile_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")
-    });
-    let profile = base.join("gate");
-    adopt_old_profile(&base.join("browser-opus"), &profile);
-    profile
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home_dir().join("AppData/Local"));
+        base.join("Gate")
+    }
+    #[cfg(not(windows))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home_dir().join(".local/share"));
+        let profile = base.join("gate");
+        adopt_old_profile(&base.join("browser-opus"), &profile);
+        profile
+    }
 }
 
+/// The user's home folder.
+pub fn home_dir() -> PathBuf {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    PathBuf::from(std::env::var_os(var).unwrap_or_default())
+}
+
+#[cfg(not(windows))]
 /// The browser was called browser-opus before it was Gate: a profile kept
 /// under the old name moves to the new one (spaces, history, settings, site
 /// data), once, if there is none under the new name yet.

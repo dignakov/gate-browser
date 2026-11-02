@@ -17,6 +17,9 @@ anyhow.workspace = true
 tracing.workspace = true
 image = { version = "0.25", default-features = false }
 futures = "0.3"
-libc = "0.2"
 sha2 = "0.10"
 async-channel = "2"
+
+# The glib bridge (Chromium's X11 clipboard waits on glib's main loop).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

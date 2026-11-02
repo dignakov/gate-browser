@@ -12,6 +12,7 @@
 
 mod app;
 mod client;
+#[cfg(target_os = "linux")]
 mod glib;
 mod keys;
 mod pump;
@@ -27,8 +28,17 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// Where the CEF distribution (libcef.so, paks, locales) lives.
-const CEF_DIR: &str = env!("OPUS_CEF_DIR");
+/// The CEF distribution the build used (development runs).
+const BUILT_CEF_DIR: &str = env!("OPUS_CEF_DIR");
+
+/// Where CEF's runtime files (paks, locales, ICU data) are: beside the
+/// executable in a packaged Gate, else in the distribution it was built with.
+fn cef_dir(exe: &Path) -> PathBuf {
+    match exe.parent() {
+        Some(dir) if dir.join("icudtl.dat").is_file() => dir.to_path_buf(),
+        _ => PathBuf::from(BUILT_CEF_DIR),
+    }
+}
 
 /// Runs this process as one of CEF's helpers (renderer, GPU, utility) when
 /// CEF launched it as one. Call first thing in `main`, before anything else
@@ -63,7 +73,7 @@ pub fn init(profile: &Path, extensions: &[PathBuf], cx: &mut gpui::App) -> Resul
     let mut app = app::build();
     std::fs::create_dir_all(profile).with_context(|| format!("creating {}", profile.display()))?;
     let exe = std::env::current_exe().context("finding this executable")?;
-    let dir = PathBuf::from(CEF_DIR);
+    let dir = cef_dir(&exe);
     let settings = cef::Settings {
         no_sandbox: 1,
         windowless_rendering_enabled: 1,

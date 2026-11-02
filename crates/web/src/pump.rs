@@ -22,6 +22,7 @@ enum Msg {
     /// A callback queued events for a view.
     Wake,
     /// glib has fds ready or a timeout due.
+    #[cfg(target_os = "linux")]
     Glib,
     Stop,
 }
@@ -64,6 +65,7 @@ pub(crate) fn start(cx: &mut App) {
     if SENDER.set(tx).is_err() {
         return;
     }
+    #[cfg(target_os = "linux")]
     crate::glib::start(|| {
         if let Some(sender) = SENDER.get() {
             let _ = sender.try_send(Msg::Glib);
@@ -83,6 +85,7 @@ pub(crate) fn start(cx: &mut App) {
                         due = Some(due.map_or(at, |d| d.min(at)));
                     }
                     Ok(Msg::Wake) => {}
+                    #[cfg(target_os = "linux")]
                     Ok(Msg::Glib) => crate::glib::dispatch(),
                     Ok(Msg::Stop) | Err(_) => break,
                 },
@@ -105,6 +108,7 @@ fn work() {
     cef::do_message_loop_work();
     WORKING.set(false);
     // CEF's work may have changed what glib waits on.
+    #[cfg(target_os = "linux")]
     crate::glib::dispatch();
 }
 

@@ -92,9 +92,7 @@ fn parse_hex(text: &str) -> Option<u32> {
 
 /// Where wallpapers come from: the chosen folder, else ~/Pictures/Wallpapers.
 pub fn wallpaper_dir(s: &Settings) -> PathBuf {
-    s.wallpaper_dir.clone().unwrap_or_else(|| {
-        PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Pictures/Wallpapers")
-    })
+    s.wallpaper_dir.clone().unwrap_or_else(|| crate::home_dir().join("Pictures").join("Wallpapers"))
 }
 
 fn field(placeholder: &str, text: String, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TextInput> {

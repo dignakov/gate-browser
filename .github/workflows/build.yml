@@ -1,0 +1,81 @@
+# Builds Gate's packages (`cargo xtask package`) for Linux and Windows.
+# Every push to devel or main: both packages are attached to the run.
+# A pushed tag v*: a GitHub Release is made with both attached.
+name: build
+
+on:
+  push:
+    branches: [devel, main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: dist/gate-linux-x86_64.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: dist/gate-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev \
+            libxcb1-dev libfontconfig-dev libfreetype-dev libglib2.0-dev \
+            libvulkan-dev libssl-dev libzstd-dev
+
+      # rustup installs the toolchain rust-toolchain.toml names.
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The CEF distribution (~1 GB) the build downloads; its version
+      # follows Cargo.lock's cef-dll-sys.
+      - uses: actions/cache@v4
+        with:
+          path: third_party/cef
+          key: cef-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cef-${{ matrix.target }}-
+
+      - name: Package
+        run: cargo xtask package --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gate-${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          compression-level: 0
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" packages/* --repo "$GITHUB_REPOSITORY" --title "Gate $GITHUB_REF_NAME" --generate-notes

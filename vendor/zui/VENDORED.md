@@ -26,3 +26,8 @@ with the new snapshot (keep this file), apply the patch, resolve conflicts.
   window. Enumerating GL starts EGL, which on NVIDIA (with Mesa's EGL beside
   it) printed "libEGL warning: egl: failed to create dri2 screen" at every
   start, and cost startup time, on machines where Vulkan works.
+- `gpui/build.rs` (and `gpui/resources/windows/gpui.rc`, removed): the
+  Windows manifest's resource script is written into OUT_DIR with the
+  manifest's absolute path. The checked-in script named it relative to the
+  crate, which llvm-rc (cross-building from Linux) resolves from OUT_DIR
+  and couldn't find.

@@ -47,10 +47,16 @@ impl Paths {
     }
 }
 
-/// The bundled copy in the source tree, if present.
+/// The bundled copy: beside the executable in a packaged Gate
+/// (`extensions/ubol`), else in the source tree it was built from.
 fn bundled() -> Option<PathBuf> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/ubol");
-    dir.join("manifest.json").is_file().then(|| dir.canonicalize().ok()).flatten()
+    let packaged = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join("extensions/ubol")));
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extensions/ubol");
+    packaged
+        .into_iter()
+        .chain([source])
+        .find(|dir| dir.join("manifest.json").is_file())
+        .and_then(|dir| dir.canonicalize().ok())
 }
 
 /// The version in an unpacked extension's manifest.
