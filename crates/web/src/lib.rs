@@ -12,8 +12,11 @@
 
 mod app;
 mod client;
+mod frames;
 #[cfg(target_os = "linux")]
 mod glib;
+#[cfg(target_os = "linux")]
+mod gpu_frames;
 mod keys;
 mod pump;
 mod renderer;
@@ -66,8 +69,11 @@ pub enum Started {
 /// one) and begins pumping its work from GPUI.
 /// `profile` holds cookies, cache and storage; one process at a time owns it.
 /// `extensions`: unpacked extension folders to load (see [`extension_id`]).
-pub fn init(profile: &Path, extensions: &[PathBuf], cx: &mut gpui::App) -> Result<Started> {
+/// `gpu_frames`: pages hand frames over as GPU buffers where the platform
+/// can (Linux for now); otherwise as pixels through the CPU.
+pub fn init(profile: &Path, extensions: &[PathBuf], gpu_frames: bool, cx: &mut gpui::App) -> Result<Started> {
     let args = cef::args::Args::new();
+    let _ = GPU_FRAMES.set(gpu_frames);
     // Read by the app object while CEF parses the command line, below.
     let _ = EXTENSIONS.set(extensions.to_vec());
     let mut app = app::build();
@@ -98,6 +104,14 @@ pub fn init(profile: &Path, extensions: &[PathBuf], cx: &mut gpui::App) -> Resul
         return Ok(Started::Elsewhere);
     }
     bail!("CEF failed to initialize (result code {code})")
+}
+
+/// Whether [`init`] was asked for GPU frames.
+static GPU_FRAMES: OnceLock<bool> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub(crate) fn gpu_frames_wanted() -> bool {
+    GPU_FRAMES.get().copied().unwrap_or(false)
 }
 
 /// The extensions [`init`] was asked to load.

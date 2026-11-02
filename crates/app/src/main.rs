@@ -57,6 +57,7 @@ fn main() {
         tracing::warn!("uBlock Origin Lite isn't installed; ad blocking is off");
     }
     let ublock = installed.clone().filter(|_| settings.ad_blocking);
+    let gpu_frames = settings.gpu_frames;
     let store = settings::Store {
         path: profile.join("settings.json"),
         ublock: ublock.as_deref().map(web::extension_id),
@@ -68,7 +69,7 @@ fn main() {
     };
 
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {
-        match web::init(&profile, ublock.as_slice(), cx) {
+        match web::init(&profile, ublock.as_slice(), gpu_frames, cx) {
             Ok(web::Started::Here) => {}
             // The running instance opens our pages.
             Ok(web::Started::Elsewhere) => return cx.quit(),

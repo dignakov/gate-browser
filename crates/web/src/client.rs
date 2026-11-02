@@ -7,7 +7,7 @@
 
 use crate::view::WebEvent;
 use cef::{rc::Rc as _, *};
-use gpui::{Bounds, CursorStyle, DevicePixels, RenderImage, point, size};
+use gpui::{CursorStyle, RenderImage};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -54,62 +54,6 @@ pub(crate) enum Reply {
     Prompt(PermissionPromptCallback, u64),
 }
 
-/// Pixels CEF painted for one surface (the page, or a `<select>` popup).
-#[derive(Default)]
-pub(crate) struct Pixmap {
-    pub width: i32,
-    pub height: i32,
-    /// BGRA, `width * 4` bytes per row.
-    pub pixels: Vec<u8>,
-    /// Regions changed since the GPU copy last took them.
-    pub damage: Vec<Bounds<DevicePixels>>,
-}
-
-impl Pixmap {
-    fn take_paint(&mut self, dirty: &[Rect], buffer: *const u8, width: i32, height: i32) {
-        if buffer.is_null() || width <= 0 || height <= 0 {
-            return;
-        }
-        let len = width as usize * height as usize * 4;
-        // SAFETY: CEF passes a `width * height` BGRA buffer valid for this call.
-        let src = unsafe { std::slice::from_raw_parts(buffer, len) };
-        let whole = Rect { x: 0, y: 0, width, height };
-        if self.width != width || self.height != height {
-            self.width = width;
-            self.height = height;
-            self.pixels = src.to_vec();
-            self.damage.clear();
-            self.damage.push(to_bounds(&whole));
-            return;
-        }
-        let stride = width as usize * 4;
-        for rect in dirty {
-            let r = clip(rect, &whole);
-            if r.width <= 0 || r.height <= 0 {
-                continue;
-            }
-            for row in r.y..r.y + r.height {
-                let start = row as usize * stride + r.x as usize * 4;
-                let end = start + r.width as usize * 4;
-                self.pixels[start..end].copy_from_slice(&src[start..end]);
-            }
-            self.damage.push(to_bounds(&r));
-        }
-    }
-}
-
-fn clip(r: &Rect, to: &Rect) -> Rect {
-    let x0 = r.x.max(to.x);
-    let y0 = r.y.max(to.y);
-    let x1 = (r.x + r.width).min(to.x + to.width);
-    let y1 = (r.y + r.height).min(to.y + to.height);
-    Rect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }
-}
-
-fn to_bounds(r: &Rect) -> Bounds<DevicePixels> {
-    Bounds::new(point(DevicePixels(r.x), DevicePixels(r.y)), size(DevicePixels(r.width), DevicePixels(r.height)))
-}
-
 /// What a web view's CEF side and GPUI side share.
 pub(crate) struct Shared {
     /// Set once CEF created the browser.
@@ -118,8 +62,13 @@ pub(crate) struct Shared {
     /// last laid it out. CEF reads them through `view_rect`/`screen_info`.
     pub view_size: (i32, i32),
     pub scale: f32,
-    pub page: Pixmap,
-    pub popup: Pixmap,
+    /// The window's atlas, which frames go into as they arrive.
+    pub frames: Option<crate::frames::Frames>,
+    pub page: crate::frames::Surface,
+    pub popup: crate::frames::Surface,
+    /// GPU frames (Linux): set while this view takes them.
+    #[cfg(target_os = "linux")]
+    pub gpu: Option<crate::gpu_frames::GpuFrames>,
     /// Where the popup sits, in logical view pixels, while shown.
     pub popup_rect: Option<Rect>,
     pub cursor: CursorStyle,
@@ -139,8 +88,11 @@ impl Shared {
             browser: None,
             view_size: (800, 600),
             scale: 1.0,
-            page: Pixmap::default(),
-            popup: Pixmap::default(),
+            frames: None,
+            page: Default::default(),
+            popup: Default::default(),
+            #[cfg(target_os = "linux")]
+            gpu: None,
             popup_rect: None,
             cursor: CursorStyle::Arrow,
             ask: None,
@@ -230,7 +182,10 @@ wrap_render_handler! {
             let mut shared = self.shared.borrow_mut();
             if show == 0 {
                 shared.popup_rect = None;
-                shared.popup = Pixmap::default();
+                let shared = &mut *shared;
+                if let Some(frames) = &shared.frames {
+                    frames.release(&mut shared.popup);
+                }
             }
             shared.push(WebEvent::Repaint);
         }
@@ -243,6 +198,28 @@ wrap_render_handler! {
             }
         }
 
+        // GPU frames (Linux): copied on the GPU before CEF takes the buffer
+        // back, which is when this returns.
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            #[cfg(target_os = "linux")]
+            {
+                let mut shared = self.shared.borrow_mut();
+                let shared = &mut *shared;
+                let (Some(gpu), Some(frames), Some(info)) = (shared.gpu.as_mut(), shared.frames.as_ref(), info) else { return };
+                let surface = if type_ == PaintElementType::POPUP { &mut shared.popup } else { &mut shared.page };
+                let event = if gpu.take(frames, surface, info, dirty_rects.unwrap_or(&[])) { WebEvent::Repaint } else { WebEvent::GpuFramesFailed };
+                shared.push(event);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = (type_, dirty_rects, info);
+        }
+
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,
@@ -253,11 +230,12 @@ wrap_render_handler! {
             height: ::std::os::raw::c_int,
         ) {
             let mut shared = self.shared.borrow_mut();
-            let dirty = dirty_rects.unwrap_or(&[]);
-            if type_ == PaintElementType::POPUP {
-                shared.popup.take_paint(dirty, buffer, width, height);
-            } else {
-                shared.page.take_paint(dirty, buffer, width, height);
+            let shared = &mut *shared;
+            let Some(frames) = shared.frames.as_ref() else { return };
+            let surface = if type_ == PaintElementType::POPUP { &mut shared.popup } else { &mut shared.page };
+            // Uploaded now, straight from CEF's buffer (valid for this call).
+            if let Err(error) = frames.take_pixels(surface, dirty_rects.unwrap_or(&[]), buffer, width, height) {
+                tracing::warn!("web frame upload: {error:#}");
             }
             shared.push(WebEvent::Repaint);
         }
@@ -385,8 +363,14 @@ wrap_life_span_handler! {
             shared.push(WebEvent::Created);
         }
 
-        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
             let mut shared = self.shared.borrow_mut();
+            // A browser replaced by a new one (see `WebView::recreate`) may
+            // close after its successor arrived.
+            let closing = browser.map(|b| b.identifier());
+            if shared.browser.as_ref().map(|b| b.identifier()) != closing {
+                return;
+            }
             shared.browser = None;
             shared.push(WebEvent::Closed);
         }

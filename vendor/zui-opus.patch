@@ -1,124 +1,33 @@
-diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
-index ccad65ac48..eb12071c3e 100644
---- a/crates/gpui/src/elements/div.rs
-+++ b/crates/gpui/src/elements/div.rs
-@@ -2344,8 +2344,10 @@ impl Interactivity {
-                 window.with_element_opacity(style.opacity, |window| {
-                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                         window.with_text_style(style.text_style().cloned(), |window| {
--                            window.with_content_mask(
-+                            // Children are clipped to the rounded corners too.
-+                            window.with_overflow_clip(
-                                 style.overflow_mask(bounds, window.rem_size()),
-+                                style.overflow_clip_radius(bounds, window.rem_size()),
-                                 |window| {
-                                     window.with_tab_group(tab_group, |window| {
-                                         // Register the container's own focus handle *inside* its
-diff --git a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
-index 0908a7ea4d..f970b09de1 100644
---- a/crates/gpui/src/style.rs
-+++ b/crates/gpui/src/style.rs
-@@ -629,6 +629,29 @@ impl Style {
-         }
-     }
+diff --git a/crates/gpui/build.rs b/crates/gpui/build.rs
+index b1bfd21..1d5943b 100644
+--- a/crates/gpui/build.rs
++++ b/crates/gpui/build.rs
+@@ -13,11 +13,19 @@ fn main() {
  
-+    /// The corner radius to clip children to, as CSS's `overflow: hidden`
-+    /// clips to `border-radius`: for an element hiding overflow on both axes
-+    /// with one radius on all four corners (inside its border). `None`
-+    /// means a rectangular clip suffices.
-+    pub fn overflow_clip_radius(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Option<Pixels> {
-+        if self.overflow.x == Overflow::Visible || self.overflow.y == Overflow::Visible {
-+            return None;
-+        }
-+        let r = self.corner_radii.map(|r| r.to_pixels(rem_size));
-+        if r.top_left != r.top_right || r.top_left != r.bottom_left || r.top_left != r.bottom_right {
-+            return None;
-+        }
-+        let border = if self.border_color.is_some_and(|color| !color.is_transparent()) {
-+            let w = &self.border_widths;
-+            [w.left, w.right, w.top, w.bottom].iter().map(|w| w.to_pixels(rem_size)).fold(Pixels::ZERO, |a, b| a.max(b))
-+        } else {
-+            Pixels::ZERO
-+        };
-+        let half = bounds.size.width.min(bounds.size.height) / 2.0;
-+        let radius = (r.top_left.min(half) - border).max(Pixels::ZERO);
-+        (radius > Pixels::ZERO).then_some(radius)
-+    }
-+
-     /// Get the content mask for this element style, based on the given bounds.
-     /// If the element does not hide its overflow, this will return `None`.
-     pub fn overflow_mask(
-diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
-index 60457ade49..614e38359a 100644
---- a/crates/gpui/src/window.rs
-+++ b/crates/gpui/src/window.rs
-@@ -1070,6 +1070,8 @@ pub struct Window {
-     sprite_atlas: Arc<dyn PlatformAtlas>,
-     text_system: Arc<WindowTextSystem>,
-     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
-+    /// Set by [`Window::set_opaque_content`].
-+    opaque_content: bool,
-     rem_size: Pixels,
-     /// The stack of override values for the window's rem size.
-     ///
-@@ -1804,6 +1806,7 @@ impl Window {
-             sprite_atlas,
-             text_system,
-             text_rendering_mode: cx.text_rendering_mode.clone(),
-+            opaque_content: false,
-             rem_size: px(16.),
-             rem_size_override_stack: SmallVec::new(),
-             viewport_size: content_size,
-@@ -2531,6 +2534,16 @@ impl Window {
-         self.platform_window.set_app_id(app_id);
-     }
- 
-+    /// Declares that, though the window's background is transparent (for
-+    /// rounded corners, say), everything text is drawn on is opaque. Subpixel
-+    /// text then stays on: its blending is exact over opaque pixels (alpha
-+    /// stays 1); only text over see-through pixels needs grayscale, and the
-+    /// window promises it draws none.
-+    pub fn set_opaque_content(&mut self, opaque: bool) {
-+        self.opaque_content = opaque;
-+        self.refresh();
-+    }
-+
-     /// Sets the window background appearance.
-     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
-         self.platform_window
-@@ -3799,6 +3812,21 @@ impl Window {
-         result
-     }
- 
-+    /// Clips to `mask` (if any), with rounded corners when `radius` is
-+    /// given: what an element hiding its overflow applies to its children
-+    /// (see [`crate::Style::overflow_clip_radius`]).
-+    pub fn with_overflow_clip<R>(
-+        &mut self,
-+        mask: Option<ContentMask<Pixels>>,
-+        radius: Option<Pixels>,
-+        f: impl FnOnce(&mut Self) -> R,
-+    ) -> R {
-+        match (mask, radius) {
-+            (Some(mask), Some(radius)) => self.with_rounded_clip(mask.bounds, radius, f),
-+            (mask, _) => self.with_content_mask(mask, f),
-+        }
-+    }
-+
-     /// Obtain the current content mask. This method should only be called during element drawing.
-     pub fn content_mask(&self) -> ContentMask<Pixels> {
-         self.invalidator.debug_assert_paint_or_prepaint();
-@@ -4451,7 +4479,7 @@ impl Window {
-     }
- 
-     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
--        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
-+        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque && !self.opaque_content {
-             return false;
-         }
- 
+ #[cfg(feature = "windows-manifest")]
+ fn embed_resource() {
+-    let manifest = std::path::Path::new("resources/windows/gpui.manifest.xml");
+-    let rc_file = std::path::Path::new("resources/windows/gpui.rc");
++    // The resource script is written with the manifest's absolute path:
++    // resource compilers resolve relative paths differently (rc.exe from
++    // the working directory, llvm-rc from the preprocessed script's folder
++    // in OUT_DIR, where a crate-relative path names nothing).
++    let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
++    let manifest = dir.join("resources/windows/gpui.manifest.xml");
+     println!("cargo:rerun-if-changed={}", manifest.display());
+-    println!("cargo:rerun-if-changed={}", rc_file.display());
+-    embed_resource::compile(rc_file, embed_resource::NONE)
++    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
++    let rc_file = out.join("gpui.rc");
++    // Forward slashes: Windows takes them, and they need no escaping here.
++    let path = manifest.display().to_string().replace('\\', "/");
++    std::fs::write(&rc_file, format!("#define RT_MANIFEST 24\n1 RT_MANIFEST \"{path}\"\n")).unwrap();
++    embed_resource::compile(&rc_file, embed_resource::NONE)
+         .manifest_required()
+         .unwrap();
+ }
 diff --git a/crates/gpui_linux/src/linux/platform.rs b/crates/gpui_linux/src/linux/platform.rs
-index 876f931663..5c17a38556 100644
+index 876f931..5c17a38 100644
 --- a/crates/gpui_linux/src/linux/platform.rs
 +++ b/crates/gpui_linux/src/linux/platform.rs
 @@ -122,6 +122,9 @@ pub(crate) struct LinuxCommon {
@@ -163,6 +72,434 @@ index 876f931663..5c17a38556 100644
      }
  
      fn compositor_name(&self) -> &'static str {
+diff --git a/crates/gpui_platform/Cargo.toml b/crates/gpui_platform/Cargo.toml
+index 22d44a9..5ba7780 100644
+--- a/crates/gpui_platform/Cargo.toml
++++ b/crates/gpui_platform/Cargo.toml
+@@ -16,7 +16,7 @@ default = []
+ font-kit = ["gpui_macos/font-kit"]
+ test-support = ["gpui/test-support", "gpui_macos/test-support"]
+ screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
+-runtime_shaders = ["gpui_macos/runtime_shaders"]
++runtime_shaders = ["gpui_macos/runtime_shaders", "gpui_windows/runtime_shaders"]
+ wayland = ["gpui_linux/wayland"]
+ x11 = ["gpui_linux/x11"]
+ 
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index ccad65a..eb12071 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -2344,8 +2344,10 @@ impl Interactivity {
+                 window.with_element_opacity(style.opacity, |window| {
+                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                         window.with_text_style(style.text_style().cloned(), |window| {
+-                            window.with_content_mask(
++                            // Children are clipped to the rounded corners too.
++                            window.with_overflow_clip(
+                                 style.overflow_mask(bounds, window.rem_size()),
++                                style.overflow_clip_radius(bounds, window.rem_size()),
+                                 |window| {
+                                     window.with_tab_group(tab_group, |window| {
+                                         // Register the container's own focus handle *inside* its
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 48ef6a2..d72e482 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1462,6 +1462,12 @@ pub trait PlatformAtlas {
+     fn import_dmabuf(&self, _dmabuf: &Dmabuf<'_>) -> Result<DmabufImport> {
+         bail!("this renderer cannot import dma-bufs")
+     }
++
++    /// Submits the updates queued so far to the GPU now rather than with the
++    /// next frame; with `wait`, returns once the GPU finished them, so their
++    /// sources are no longer read. For producers that must hand a buffer
++    /// back as soon as it is copied.
++    fn flush(&self, _wait: bool) {}
+ }
+ 
+ #[doc(hidden)]
+diff --git a/crates/gpui/src/style.rs b/crates/gpui/src/style.rs
+index 0908a7e..f970b09 100644
+--- a/crates/gpui/src/style.rs
++++ b/crates/gpui/src/style.rs
+@@ -629,6 +629,29 @@ impl Style {
+         }
+     }
+ 
++    /// The corner radius to clip children to, as CSS's `overflow: hidden`
++    /// clips to `border-radius`: for an element hiding overflow on both axes
++    /// with one radius on all four corners (inside its border). `None`
++    /// means a rectangular clip suffices.
++    pub fn overflow_clip_radius(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> Option<Pixels> {
++        if self.overflow.x == Overflow::Visible || self.overflow.y == Overflow::Visible {
++            return None;
++        }
++        let r = self.corner_radii.map(|r| r.to_pixels(rem_size));
++        if r.top_left != r.top_right || r.top_left != r.bottom_left || r.top_left != r.bottom_right {
++            return None;
++        }
++        let border = if self.border_color.is_some_and(|color| !color.is_transparent()) {
++            let w = &self.border_widths;
++            [w.left, w.right, w.top, w.bottom].iter().map(|w| w.to_pixels(rem_size)).fold(Pixels::ZERO, |a, b| a.max(b))
++        } else {
++            Pixels::ZERO
++        };
++        let half = bounds.size.width.min(bounds.size.height) / 2.0;
++        let radius = (r.top_left.min(half) - border).max(Pixels::ZERO);
++        (radius > Pixels::ZERO).then_some(radius)
++    }
++
+     /// Get the content mask for this element style, based on the given bounds.
+     /// If the element does not hide its overflow, this will return `None`.
+     pub fn overflow_mask(
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 60457ad..74bccaa 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1070,6 +1070,8 @@ pub struct Window {
+     sprite_atlas: Arc<dyn PlatformAtlas>,
+     text_system: Arc<WindowTextSystem>,
+     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
++    /// Set by [`Window::set_opaque_content`].
++    opaque_content: bool,
+     rem_size: Pixels,
+     /// The stack of override values for the window's rem size.
+     ///
+@@ -1804,6 +1806,7 @@ impl Window {
+             sprite_atlas,
+             text_system,
+             text_rendering_mode: cx.text_rendering_mode.clone(),
++            opaque_content: false,
+             rem_size: px(16.),
+             rem_size_override_stack: SmallVec::new(),
+             viewport_size: content_size,
+@@ -1882,6 +1885,84 @@ pub struct DispatchEventResult {
+     pub default_prevented: bool,
+ }
+ 
++/// A window's sprite atlas, for images updated outside of painting (for
++/// example from a callback that must copy a frame before returning it).
++/// Main thread only, like the window. Obtained from [`Window::atlas_handle`].
++#[derive(Clone)]
++pub struct AtlasHandle(Arc<dyn PlatformAtlas>);
++
++impl AtlasHandle {
++    fn key(data: &RenderImage, frame_index: usize) -> crate::AtlasKey {
++        RenderImageParams {
++            image_id: data.id,
++            frame_index,
++        }
++        .into()
++    }
++
++    /// Allocates the tile of a [`RenderImage::blank`] image without uploading
++    /// its blank pixels. Returns whether the tile is new: its content is
++    /// undefined until [`Self::update_image`] fills all of it.
++    pub fn insert_blank_image(&self, data: &RenderImage, frame_index: usize) -> Result<bool> {
++        let key = Self::key(data, frame_index);
++        match self.0.insert_blank(&key, data.size(frame_index))? {
++            Some(created) => Ok(created),
++            // Upload the blank pixels instead.
++            None => {
++                let size = data.size(frame_index);
++                let bytes = data
++                    .as_bytes(frame_index)
++                    .ok_or_else(|| anyhow!("image has no frame {frame_index}"))?;
++                let mut created = false;
++                self.0.get_or_insert_with(&key, &mut || {
++                    created = true;
++                    Ok(Some((size, Cow::Borrowed(bytes))))
++                })?;
++                Ok(created)
++            }
++        }
++    }
++
++    /// Overwrites `region` (device pixels, within the image) of `data`'s
++    /// atlas tile; see [`PlatformAtlas::update_tile`]. `Ok(false)` when the
++    /// atlas holds no tile for it or cannot update tiles in place.
++    pub fn update_image(
++        &self,
++        data: &RenderImage,
++        frame_index: usize,
++        region: Bounds<DevicePixels>,
++        update: crate::AtlasTileUpdate<'_>,
++        on_complete: Option<Box<dyn FnOnce() + Send>>,
++    ) -> Result<bool> {
++        self.0
++            .update_tile(&Self::key(data, frame_index), region, update, on_complete)
++    }
++
++    /// Frees `data`'s tile.
++    pub fn remove_image(&self, data: &RenderImage, frame_index: usize) {
++        self.0.remove(&Self::key(data, frame_index));
++    }
++
++    /// The GPU the atlas lives on and the dma-bufs it can import.
++    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
++    pub fn dmabuf_target(&self) -> Option<crate::DmabufTarget> {
++        self.0.dmabuf_target()
++    }
++
++    /// Imports a dma-buf for [`crate::AtlasTileUpdate::Dmabuf`] updates,
++    /// until the returned import is dropped.
++    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
++    pub fn import_dmabuf(&self, dmabuf: &crate::Dmabuf<'_>) -> Result<crate::DmabufImport> {
++        self.0.import_dmabuf(dmabuf)
++    }
++
++    /// Submits the updates queued so far now; with `wait`, returns once the
++    /// GPU finished them (see [`PlatformAtlas::flush`]).
++    pub fn flush(&self, wait: bool) {
++        self.0.flush(wait);
++    }
++}
++
+ /// Indicates which region of the window is visible. Content falling outside of this mask will not be
+ /// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
+ /// to leave room to support more complex shapes in the future.
+@@ -2531,6 +2612,16 @@ impl Window {
+         self.platform_window.set_app_id(app_id);
+     }
+ 
++    /// Declares that, though the window's background is transparent (for
++    /// rounded corners, say), everything text is drawn on is opaque. Subpixel
++    /// text then stays on: its blending is exact over opaque pixels (alpha
++    /// stays 1); only text over see-through pixels needs grayscale, and the
++    /// window promises it draws none.
++    pub fn set_opaque_content(&mut self, opaque: bool) {
++        self.opaque_content = opaque;
++        self.refresh();
++    }
++
+     /// Sets the window background appearance.
+     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
+         self.platform_window
+@@ -3799,6 +3890,21 @@ impl Window {
+         result
+     }
+ 
++    /// Clips to `mask` (if any), with rounded corners when `radius` is
++    /// given: what an element hiding its overflow applies to its children
++    /// (see [`crate::Style::overflow_clip_radius`]).
++    pub fn with_overflow_clip<R>(
++        &mut self,
++        mask: Option<ContentMask<Pixels>>,
++        radius: Option<Pixels>,
++        f: impl FnOnce(&mut Self) -> R,
++    ) -> R {
++        match (mask, radius) {
++            (Some(mask), Some(radius)) => self.with_rounded_clip(mask.bounds, radius, f),
++            (mask, _) => self.with_content_mask(mask, f),
++        }
++    }
++
+     /// Obtain the current content mask. This method should only be called during element drawing.
+     pub fn content_mask(&self) -> ContentMask<Pixels> {
+         self.invalidator.debug_assert_paint_or_prepaint();
+@@ -4451,7 +4557,7 @@ impl Window {
+     }
+ 
+     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
++        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque && !self.opaque_content {
+             return false;
+         }
+ 
+@@ -4855,13 +4961,14 @@ impl Window {
+         Ok(())
+     }
+ 
+-    /// Overwrites a region of an image already painted with
+-    /// [`Self::paint_image`], so a producer that tracks damage uploads only what
+-    /// changed; a [`RenderImage::blank`] image gets its tile from
+-    /// [`Self::insert_blank_image`] instead. Returns `Ok(false)` when the image
+-    /// has no tile (or the renderer cannot update in place); paint a complete
+-    /// image instead. `on_complete` runs exactly once, as
+-    /// [`PlatformAtlas::update_tile`] describes.
++    /// The window's sprite atlas, for producers that update images outside of
++    /// painting: a callback during the event loop, say. See [`AtlasHandle`].
++    pub fn atlas_handle(&self) -> AtlasHandle {
++        AtlasHandle(self.sprite_atlas.clone())
++    }
++
++    /// Overwrites `region` (device pixels, within the image) of `data`'s
++    /// atlas tile; see [`AtlasHandle::update_image`].
+     pub fn update_image(
+         &mut self,
+         data: &RenderImage,
+@@ -4870,13 +4977,7 @@ impl Window {
+         update: crate::AtlasTileUpdate<'_>,
+         on_complete: Option<Box<dyn FnOnce() + Send>>,
+     ) -> Result<bool> {
+-        let key: crate::AtlasKey = RenderImageParams {
+-            image_id: data.id,
+-            frame_index,
+-        }
+-        .into();
+-        self.sprite_atlas
+-            .update_tile(&key, region, update, on_complete)
++        self.atlas_handle().update_image(data, frame_index, region, update, on_complete)
+     }
+ 
+     /// Allocates the tile of a [`RenderImage::blank`] image without uploading
+@@ -4884,27 +4985,7 @@ impl Window {
+     /// undefined until [`Self::update_image`] fills all of it. An atlas can drop
+     /// tiles (a lost GPU), so call this before each round of updates.
+     pub fn insert_blank_image(&mut self, data: &RenderImage, frame_index: usize) -> Result<bool> {
+-        let key: crate::AtlasKey = RenderImageParams {
+-            image_id: data.id,
+-            frame_index,
+-        }
+-        .into();
+-        match self.sprite_atlas.insert_blank(&key, data.size(frame_index))? {
+-            Some(created) => Ok(created),
+-            // Upload the blank pixels instead.
+-            None => {
+-                let size = data.size(frame_index);
+-                let bytes = data
+-                    .as_bytes(frame_index)
+-                    .ok_or_else(|| anyhow!("image has no frame {frame_index}"))?;
+-                let mut created = false;
+-                self.sprite_atlas.get_or_insert_with(&key, &mut || {
+-                    created = true;
+-                    Ok(Some((size, Cow::Borrowed(bytes))))
+-                })?;
+-                Ok(created)
+-            }
+-        }
++        self.atlas_handle().insert_blank_image(data, frame_index)
+     }
+ 
+     /// The GPU this window renders on and the dma-bufs it can import.
+diff --git a/crates/gpui_wgpu/src/wgpu_atlas.rs b/crates/gpui_wgpu/src/wgpu_atlas.rs
+index 574fce8..b860336 100644
+--- a/crates/gpui_wgpu/src/wgpu_atlas.rs
++++ b/crates/gpui_wgpu/src/wgpu_atlas.rs
+@@ -116,21 +116,27 @@ impl WgpuAtlas {
+     }
+ 
+     pub fn before_frame(&self) {
+-        let (device, queue, copies, completions) = {
++        self.submit();
++        let device = self.0.lock().device.clone();
++        let _ = device.poll(wgpu::PollType::Poll);
++    }
++
++    /// Submits queued uploads and copies; their completions run once the
++    /// GPU finished them.
++    fn submit(&self) -> wgpu::SubmissionIndex {
++        let (queue, copies, completions) = {
+             let mut lock = self.0.lock();
+             lock.flush_uploads();
+             (
+-                lock.device.clone(),
+                 lock.queue.clone(),
+                 lock.take_copies(),
+                 std::mem::take(&mut lock.completions),
+             )
+         };
+         // Submitting and polling may run completion callbacks, which may call
+-        // back into the atlas: never hold the lock across them.
+-        if let Some(copies) = copies {
+-            queue.submit([copies]);
+-        }
++        // back into the atlas: never hold the lock across them. An empty
++        // submission still carries the queued uploads.
++        let index = queue.submit(copies);
+         if !completions.is_empty() {
+             queue.on_submitted_work_done(move || {
+                 for complete in completions {
+@@ -138,7 +144,7 @@ impl WgpuAtlas {
+                 }
+             });
+         }
+-        let _ = device.poll(wgpu::PollType::Poll);
++        index
+     }
+ 
+     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
+@@ -261,6 +267,19 @@ impl PlatformAtlas for WgpuAtlas {
+         }
+     }
+ 
++    fn flush(&self, wait: bool) {
++        let index = self.submit();
++        let device = self.0.lock().device.clone();
++        let poll = if wait {
++            wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::from_secs(1)) }
++        } else {
++            wgpu::PollType::Poll
++        };
++        if let Err(error) = device.poll(poll) {
++            log::warn!("flushing atlas updates: {error}");
++        }
++    }
++
+     fn update_tile(
+         &self,
+         key: &AtlasKey,
+@@ -375,6 +394,47 @@ impl WgpuAtlasState {
+                     "{} bytes cannot hold {rows} rows of {row} bytes, {stride} apart",
+                     bytes.len()
+                 );
++                // Uploads land before this frame's copies: a copy queued
++                // earlier would overwrite these newer pixels.
++                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
++                self.pending_copies.retain(|copy| {
++                    copy.id != tile.texture_id || bounds.intersect(&copy.bounds) != copy.bounds
++                });
++                if format == wgpu::TextureFormat::Bgra8Unorm {
++                    // As they are: the queue copies the rows (strided) into
++                    // its staging memory now, and the write lands with the
++                    // next submission, before its copies, as a queued upload
++                    // would. One copy instead of two.
++                    // After the uploads queued before it, as they would land.
++                    self.flush_uploads();
++                    let Some(texture) = self.storage.get(tile.texture_id) else {
++                        return Ok(false);
++                    };
++                    self.queue.write_texture(
++                        wgpu::TexelCopyTextureInfo {
++                            texture: &texture.texture,
++                            mip_level: 0,
++                            origin: wgpu::Origin3d {
++                                x: bounds.origin.x.0 as u32,
++                                y: bounds.origin.y.0 as u32,
++                                z: 0,
++                            },
++                            aspect: wgpu::TextureAspect::All,
++                        },
++                        &bytes[..stride * (rows - 1) + row],
++                        wgpu::TexelCopyBufferLayout {
++                            offset: 0,
++                            bytes_per_row: Some(bytes_per_row),
++                            rows_per_image: None,
++                        },
++                        wgpu::Extent3d {
++                            width: region.size.width.0 as u32,
++                            height: rows as u32,
++                            depth_or_array_layers: 1,
++                        },
++                    );
++                    return Ok(true);
++                }
+                 let mut data = Vec::with_capacity(row * rows);
+                 for line in bytes.chunks(stride).take(rows) {
+                     data.extend_from_slice(&line[..row]);
+@@ -384,12 +444,6 @@ impl WgpuAtlasState {
+                         pixel.swap(0, 2);
+                     }
+                 }
+-                // Uploads land before this frame's copies: a copy queued
+-                // earlier would overwrite these newer pixels.
+-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+-                self.pending_copies.retain(|copy| {
+-                    copy.id != tile.texture_id || bounds.intersect(&copy.bounds) != copy.bounds
+-                });
+                 self.pending_uploads.push(PendingUpload {
+                     id: tile.texture_id,
+                     bounds,
 diff --git a/crates/gpui_wgpu/src/wgpu_context.rs b/crates/gpui_wgpu/src/wgpu_context.rs
 index 0253fa3..fa7930d 100644
 --- a/crates/gpui_wgpu/src/wgpu_context.rs
@@ -299,43 +636,39 @@ index caec6db..2aa8ddb 100644
  fn create_surface(
      instance: &wgpu::Instance,
      raw_window_handle: raw_window_handle::RawWindowHandle,
-diff --git a/crates/gpui/build.rs b/crates/gpui/build.rs
-index b1bfd21..1d5943b 100644
---- a/crates/gpui/build.rs
-+++ b/crates/gpui/build.rs
-@@ -13,11 +13,19 @@ fn main() {
- 
- #[cfg(feature = "windows-manifest")]
- fn embed_resource() {
--    let manifest = std::path::Path::new("resources/windows/gpui.manifest.xml");
--    let rc_file = std::path::Path::new("resources/windows/gpui.rc");
-+    // The resource script is written with the manifest's absolute path:
-+    // resource compilers resolve relative paths differently (rc.exe from
-+    // the working directory, llvm-rc from the preprocessed script's folder
-+    // in OUT_DIR, where a crate-relative path names nothing).
-+    let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-+    let manifest = dir.join("resources/windows/gpui.manifest.xml");
-     println!("cargo:rerun-if-changed={}", manifest.display());
--    println!("cargo:rerun-if-changed={}", rc_file.display());
--    embed_resource::compile(rc_file, embed_resource::NONE)
-+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-+    let rc_file = out.join("gpui.rc");
-+    // Forward slashes: Windows takes them, and they need no escaping here.
-+    let path = manifest.display().to_string().replace('\\', "/");
-+    std::fs::write(&rc_file, format!("#define RT_MANIFEST 24\n1 RT_MANIFEST \"{path}\"\n")).unwrap();
-+    embed_resource::compile(&rc_file, embed_resource::NONE)
-         .manifest_required()
-         .unwrap();
+diff --git a/crates/gpui_windows/build.rs b/crates/gpui_windows/build.rs
+index 1b36438..8582503 100644
+--- a/crates/gpui_windows/build.rs
++++ b/crates/gpui_windows/build.rs
+@@ -3,9 +3,11 @@
+ fn main() {
+     #[cfg(target_os = "windows")]
+     {
+-        // Compile HLSL shaders
++        // Compile HLSL shaders, unless the renderer compiles them itself.
+         #[cfg(not(debug_assertions))]
+-        compile_shaders();
++        if std::env::var_os("CARGO_FEATURE_RUNTIME_SHADERS").is_none() {
++            compile_shaders();
++        }
+     }
  }
-diff --git a/crates/gpui/resources/windows/gpui.rc b/crates/gpui/resources/windows/gpui.rc
-deleted file mode 100644
-index a6f3787..0000000
---- a/crates/gpui/resources/windows/gpui.rc
-+++ /dev/null
-@@ -1,2 +0,0 @@
--#define RT_MANIFEST 24
--1 RT_MANIFEST "resources/windows/gpui.manifest.xml"
-\ No newline at end of file
+ 
+diff --git a/crates/gpui_windows/Cargo.toml b/crates/gpui_windows/Cargo.toml
+index 0715cbc..c33709b 100644
+--- a/crates/gpui_windows/Cargo.toml
++++ b/crates/gpui_windows/Cargo.toml
+@@ -15,6 +15,10 @@ path = "src/gpui_windows.rs"
+ default = ["gpui/default"]
+ test-support = ["gpui/test-support"]
+ screen-capture = ["gpui/screen-capture", "scap"]
++# Compile the HLSL shaders when the renderer starts (from source built into
++# the binary) instead of with fxc.exe at build time: builds need no Windows
++# SDK tools, so they can be made off Windows.
++runtime_shaders = []
+ 
+ [dependencies]
+ gpui.workspace = true
 diff --git a/crates/gpui_windows/src/directx_atlas.rs b/crates/gpui_windows/src/directx_atlas.rs
 index 6238699..6012bdf 100644
 --- a/crates/gpui_windows/src/directx_atlas.rs
@@ -448,6 +781,201 @@ index 6238699..6012bdf 100644
      fn remove(&self, key: &AtlasKey) {
          let mut lock = self.0.lock();
  
+diff --git a/crates/gpui_windows/src/directx_renderer.rs b/crates/gpui_windows/src/directx_renderer.rs
+index 45ed63b..af88a7c 100644
+--- a/crates/gpui_windows/src/directx_renderer.rs
++++ b/crates/gpui_windows/src/directx_renderer.rs
+@@ -1848,13 +1848,16 @@ const BUFFER_COUNT: usize = 3;
+ pub(crate) mod shader_resources {
+     use anyhow::Result;
+ 
+-    #[cfg(debug_assertions)]
++    #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
+     use windows::{
+         Win32::Graphics::Direct3D::{
+-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
+-            ID3DBlob,
++            Fxc::{
++                D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION,
++                D3DCompile,
++            },
++            ID3DBlob, ID3DInclude,
+         },
+-        core::{HSTRING, PCSTR},
++        core::PCSTR,
+     };
+ 
+     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+@@ -1881,17 +1884,17 @@ pub(crate) mod shader_resources {
+     pub(crate) struct RawShaderBytes<'t> {
+         inner: &'t [u8],
+ 
+-        #[cfg(debug_assertions)]
++        #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
+         _blob: ID3DBlob,
+     }
+ 
+     impl<'t> RawShaderBytes<'t> {
+         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
+-            #[cfg(not(debug_assertions))]
++            #[cfg(not(any(debug_assertions, feature = "runtime_shaders")))]
+             {
+                 Ok(Self::from_bytes(module, target))
+             }
+-            #[cfg(debug_assertions)]
++            #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
+             {
+                 let blob = build_shader_blob(module, target)?;
+                 let inner = unsafe {
+@@ -1908,7 +1911,7 @@ pub(crate) mod shader_resources {
+             self.inner
+         }
+ 
+-        #[cfg(not(debug_assertions))]
++        #[cfg(not(any(debug_assertions, feature = "runtime_shaders")))]
+         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
+             let bytes = match module {
+                 ShaderModule::BackdropPass => match target {
+@@ -1960,76 +1963,80 @@ pub(crate) mod shader_resources {
+         }
+     }
+ 
+-    #[cfg(debug_assertions)]
+-    pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+-        unsafe {
+-            use windows::Win32::Graphics::{
+-                Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
+-            };
+-
+-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
+-                "color_text_raster.hlsl"
+-            } else {
+-                "shaders.hlsl"
+-            };
+-
+-            let entry = format!(
+-                "{}_{}\0",
+-                entry.as_str(),
+-                match target {
+-                    ShaderTarget::Vertex => "vertex",
+-                    ShaderTarget::Fragment => "fragment",
+-                }
+-            );
+-            let target = match target {
+-                ShaderTarget::Vertex => "vs_4_1\0",
+-                ShaderTarget::Fragment => "ps_4_1\0",
+-            };
+-
+-            let mut compile_blob = None;
+-            let mut error_blob = None;
+-            let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+-                .join(&format!("src/{}", shader_name))
+-                .canonicalize()?;
+-
+-            let entry_point = PCSTR::from_raw(entry.as_ptr());
+-            let target_cstr = PCSTR::from_raw(target.as_ptr());
+-
+-            // really dirty trick because winapi bindings are unhappy otherwise
+-            let include_handler = &std::mem::transmute::<usize, ID3DInclude>(
+-                D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
+-            );
++    /// The HLSL for a module, with its one `#include` spliced in: compiled
++    /// from memory, so the binary needs no source files where it runs.
++    #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
++    fn shader_source(entry: ShaderModule) -> String {
++        const SHADERS: &str = include_str!("shaders.hlsl");
++        const COLOR_TEXT_RASTER: &str = include_str!("color_text_raster.hlsl");
++        const ALPHA_CORRECTION: &str = include_str!("alpha_correction.hlsl");
++        let source = if matches!(entry, ShaderModule::EmojiRasterization) {
++            COLOR_TEXT_RASTER
++        } else {
++            SHADERS
++        };
++        source.replace("#include \"alpha_correction.hlsl\"", ALPHA_CORRECTION)
++    }
+ 
+-            let ret = D3DCompileFromFile(
+-                &HSTRING::from(shader_path.to_str().unwrap()),
++    /// Compiles a module's shader when the renderer starts (see the
++    /// `runtime_shaders` feature): debuggable in debug builds, optimized
++    /// otherwise.
++    #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
++    pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
++        let source = shader_source(entry);
++        let entry_point = format!(
++            "{}_{}\0",
++            entry.as_str(),
++            match target {
++                ShaderTarget::Vertex => "vertex",
++                ShaderTarget::Fragment => "fragment",
++            }
++        );
++        let target = match target {
++            ShaderTarget::Vertex => "vs_4_1\0",
++            ShaderTarget::Fragment => "ps_4_1\0",
++        };
++        let flags = if cfg!(debug_assertions) {
++            D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
++        } else {
++            D3DCOMPILE_OPTIMIZATION_LEVEL3
++        };
++        let mut compile_blob = None;
++        let mut error_blob = None;
++        let ret = unsafe {
++            D3DCompile(
++                source.as_ptr().cast(),
++                source.len(),
++                PCSTR::from_raw(c"gpui_windows.hlsl".as_ptr().cast()),
+                 None,
+-                include_handler,
+-                entry_point,
+-                target_cstr,
+-                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
++                None::<&ID3DInclude>,
++                PCSTR::from_raw(entry_point.as_ptr()),
++                PCSTR::from_raw(target.as_ptr()),
++                flags,
+                 0,
+                 &mut compile_blob,
+                 Some(&mut error_blob),
+-            );
+-            if ret.is_err() {
+-                let Some(error_blob) = error_blob else {
+-                    return Err(anyhow::anyhow!("{ret:?}"));
+-                };
+-
+-                let error_string =
+-                    std::ffi::CStr::from_ptr(error_blob.GetBufferPointer() as *const i8)
+-                        .to_string_lossy();
+-                log::error!("Shader compile error: {}", error_string);
+-                return Err(anyhow::anyhow!("Compile error: {}", error_string));
++            )
++        };
++        if let Err(error) = ret {
++            let Some(error_blob) = error_blob else {
++                return Err(anyhow::anyhow!("{error:?}"));
++            };
++            let message = unsafe {
++                std::ffi::CStr::from_ptr(error_blob.GetBufferPointer() as *const std::ffi::c_char)
+             }
+-            Ok(compile_blob.unwrap())
++            .to_string_lossy()
++            .into_owned();
++            log::error!("Shader compile error: {message}");
++            return Err(anyhow::anyhow!("Compile error: {message}"));
+         }
++        compile_blob.ok_or_else(|| anyhow::anyhow!("D3DCompile returned no shader"))
+     }
+ 
+-    #[cfg(not(debug_assertions))]
++    #[cfg(not(any(debug_assertions, feature = "runtime_shaders")))]
+     include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
+ 
+-    #[cfg(debug_assertions)]
++    #[cfg(any(debug_assertions, feature = "runtime_shaders"))]
+     impl ShaderModule {
+         pub fn as_str(self) -> &'static str {
+             match self {
 diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
 index a2ef0d3..a338748 100644
 --- a/crates/gpui_windows/src/window.rs
@@ -467,3 +995,12 @@ index a2ef0d3..a338748 100644
              } else if let Some(mut status) = self.state.initial_placement.take() {
                  status.state = WindowOpenState::Maximized;
                  self.state.initial_placement.set(Some(status));
+diff --git a/crates/gpui/resources/windows/gpui.rc b/crates/gpui/resources/windows/gpui.rc
+deleted file mode 100644
+index a6f3787..0000000
+--- a/crates/gpui/resources/windows/gpui.rc
++++ /dev/null
+@@ -1,2 +0,0 @@
+-#define RT_MANIFEST 24
+-1 RT_MANIFEST "resources/windows/gpui.manifest.xml"
+\ No newline at end of file

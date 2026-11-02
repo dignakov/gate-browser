@@ -1462,6 +1462,12 @@ pub trait PlatformAtlas {
     fn import_dmabuf(&self, _dmabuf: &Dmabuf<'_>) -> Result<DmabufImport> {
         bail!("this renderer cannot import dma-bufs")
     }
+
+    /// Submits the updates queued so far to the GPU now rather than with the
+    /// next frame; with `wait`, returns once the GPU finished them, so their
+    /// sources are no longer read. For producers that must hand a buffer
+    /// back as soon as it is copied.
+    fn flush(&self, _wait: bool) {}
 }
 
 #[doc(hidden)]

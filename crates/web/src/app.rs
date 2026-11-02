@@ -19,6 +19,17 @@ wrap_app! {
             let Some(command_line) = command_line else { return };
             // The browser process (no type) loads the extensions.
             let browser = process_type.is_none_or(|t| t.to_string().is_empty());
+            // GPU frames (Linux): Chromium shares dma-bufs when it draws with
+            // Vulkan (through ANGLE); GLX, X11's default, can't. An explicit
+            // --use-angle wins.
+            #[cfg(target_os = "linux")]
+            if browser && crate::gpu_frames_wanted() && command_line.has_switch(Some(&"use-angle".into())) == 0 {
+                command_line.append_switch_with_value(Some(&"use-angle".into()), Some(&"vulkan".into()));
+                command_line.append_switch_with_value(
+                    Some(&"enable-features".into()),
+                    Some(&"Vulkan,VulkanFromANGLE,DefaultANGLEVulkan".into()),
+                );
+            }
             let extensions = crate::EXTENSIONS.get().filter(|e| browser && !e.is_empty());
             if let Some(extensions) = extensions {
                 // Chromium splits the list on commas.

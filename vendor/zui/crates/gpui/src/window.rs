@@ -1885,6 +1885,84 @@ pub struct DispatchEventResult {
     pub default_prevented: bool,
 }
 
+/// A window's sprite atlas, for images updated outside of painting (for
+/// example from a callback that must copy a frame before returning it).
+/// Main thread only, like the window. Obtained from [`Window::atlas_handle`].
+#[derive(Clone)]
+pub struct AtlasHandle(Arc<dyn PlatformAtlas>);
+
+impl AtlasHandle {
+    fn key(data: &RenderImage, frame_index: usize) -> crate::AtlasKey {
+        RenderImageParams {
+            image_id: data.id,
+            frame_index,
+        }
+        .into()
+    }
+
+    /// Allocates the tile of a [`RenderImage::blank`] image without uploading
+    /// its blank pixels. Returns whether the tile is new: its content is
+    /// undefined until [`Self::update_image`] fills all of it.
+    pub fn insert_blank_image(&self, data: &RenderImage, frame_index: usize) -> Result<bool> {
+        let key = Self::key(data, frame_index);
+        match self.0.insert_blank(&key, data.size(frame_index))? {
+            Some(created) => Ok(created),
+            // Upload the blank pixels instead.
+            None => {
+                let size = data.size(frame_index);
+                let bytes = data
+                    .as_bytes(frame_index)
+                    .ok_or_else(|| anyhow!("image has no frame {frame_index}"))?;
+                let mut created = false;
+                self.0.get_or_insert_with(&key, &mut || {
+                    created = true;
+                    Ok(Some((size, Cow::Borrowed(bytes))))
+                })?;
+                Ok(created)
+            }
+        }
+    }
+
+    /// Overwrites `region` (device pixels, within the image) of `data`'s
+    /// atlas tile; see [`PlatformAtlas::update_tile`]. `Ok(false)` when the
+    /// atlas holds no tile for it or cannot update tiles in place.
+    pub fn update_image(
+        &self,
+        data: &RenderImage,
+        frame_index: usize,
+        region: Bounds<DevicePixels>,
+        update: crate::AtlasTileUpdate<'_>,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<bool> {
+        self.0
+            .update_tile(&Self::key(data, frame_index), region, update, on_complete)
+    }
+
+    /// Frees `data`'s tile.
+    pub fn remove_image(&self, data: &RenderImage, frame_index: usize) {
+        self.0.remove(&Self::key(data, frame_index));
+    }
+
+    /// The GPU the atlas lives on and the dma-bufs it can import.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn dmabuf_target(&self) -> Option<crate::DmabufTarget> {
+        self.0.dmabuf_target()
+    }
+
+    /// Imports a dma-buf for [`crate::AtlasTileUpdate::Dmabuf`] updates,
+    /// until the returned import is dropped.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn import_dmabuf(&self, dmabuf: &crate::Dmabuf<'_>) -> Result<crate::DmabufImport> {
+        self.0.import_dmabuf(dmabuf)
+    }
+
+    /// Submits the updates queued so far now; with `wait`, returns once the
+    /// GPU finished them (see [`PlatformAtlas::flush`]).
+    pub fn flush(&self, wait: bool) {
+        self.0.flush(wait);
+    }
+}
+
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
 /// to leave room to support more complex shapes in the future.
@@ -4883,13 +4961,14 @@ impl Window {
         Ok(())
     }
 
-    /// Overwrites a region of an image already painted with
-    /// [`Self::paint_image`], so a producer that tracks damage uploads only what
-    /// changed; a [`RenderImage::blank`] image gets its tile from
-    /// [`Self::insert_blank_image`] instead. Returns `Ok(false)` when the image
-    /// has no tile (or the renderer cannot update in place); paint a complete
-    /// image instead. `on_complete` runs exactly once, as
-    /// [`PlatformAtlas::update_tile`] describes.
+    /// The window's sprite atlas, for producers that update images outside of
+    /// painting: a callback during the event loop, say. See [`AtlasHandle`].
+    pub fn atlas_handle(&self) -> AtlasHandle {
+        AtlasHandle(self.sprite_atlas.clone())
+    }
+
+    /// Overwrites `region` (device pixels, within the image) of `data`'s
+    /// atlas tile; see [`AtlasHandle::update_image`].
     pub fn update_image(
         &mut self,
         data: &RenderImage,
@@ -4898,13 +4977,7 @@ impl Window {
         update: crate::AtlasTileUpdate<'_>,
         on_complete: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<bool> {
-        let key: crate::AtlasKey = RenderImageParams {
-            image_id: data.id,
-            frame_index,
-        }
-        .into();
-        self.sprite_atlas
-            .update_tile(&key, region, update, on_complete)
+        self.atlas_handle().update_image(data, frame_index, region, update, on_complete)
     }
 
     /// Allocates the tile of a [`RenderImage::blank`] image without uploading
@@ -4912,27 +4985,7 @@ impl Window {
     /// undefined until [`Self::update_image`] fills all of it. An atlas can drop
     /// tiles (a lost GPU), so call this before each round of updates.
     pub fn insert_blank_image(&mut self, data: &RenderImage, frame_index: usize) -> Result<bool> {
-        let key: crate::AtlasKey = RenderImageParams {
-            image_id: data.id,
-            frame_index,
-        }
-        .into();
-        match self.sprite_atlas.insert_blank(&key, data.size(frame_index))? {
-            Some(created) => Ok(created),
-            // Upload the blank pixels instead.
-            None => {
-                let size = data.size(frame_index);
-                let bytes = data
-                    .as_bytes(frame_index)
-                    .ok_or_else(|| anyhow!("image has no frame {frame_index}"))?;
-                let mut created = false;
-                self.sprite_atlas.get_or_insert_with(&key, &mut || {
-                    created = true;
-                    Ok(Some((size, Cow::Borrowed(bytes))))
-                })?;
-                Ok(created)
-            }
-        }
+        self.atlas_handle().insert_blank_image(data, frame_index)
     }
 
     /// The GPU this window renders on and the dma-bufs it can import.

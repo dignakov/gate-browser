@@ -12,10 +12,10 @@
 //!
 //! plus `dist/gate-<os>-<arch>.tar.gz` (Linux) or `.zip` (Windows).
 //!
-//! Windows packages are built on Windows (CI does): GPUI compiles its
-//! shaders with fxc.exe, which only exists there. From Linux,
-//! `cargo xtask check-windows` cross-builds a debug Gate with cargo-xwin
-//! (debug GPUI compiles shaders at startup instead) to catch errors early.
+//! Windows builds natively, or from Linux with cargo-xwin (the MSVC runtime
+//! and Windows SDK) and LLVM's clang-cl and lld-link: GPUI compiles its
+//! Windows shaders at startup (`runtime_shaders`), so no fxc.exe is needed.
+//! `cargo xtask check-windows` is the quick debug build of the same.
 
 use anyhow::{Context as _, Result, bail, ensure};
 use std::fs;
@@ -53,13 +53,13 @@ fn package(target: &str) -> Result<()> {
     let arch = target.split('-').next().unwrap_or("x86_64");
     let root = root();
 
-    ensure!(
-        !windows || cfg!(windows),
-        "Windows packages are built on Windows (GPUI's shaders need fxc.exe); \
-         from here, `cargo xtask check-windows` checks the Windows build"
-    );
-    let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cargo.current_dir(&root);
+    let mut cargo = if windows && !cfg!(windows) {
+        xwin()?
+    } else {
+        let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+        cargo.current_dir(&root);
+        cargo
+    };
     cargo.args(["build", "--package", "gate", "--profile", "dist", "--target", target]);
     run(&mut cargo).context("building Gate")?;
 
@@ -113,19 +113,21 @@ fn package(target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Cross-builds a debug Gate for Windows with cargo-xwin, which brings the
-/// MSVC runtime and Windows SDK; clang-cl and lld-link come from the newest
-/// LLVM installed (MSVC's current C++ library wants Clang 19 or newer).
+/// Cross-builds a debug Gate for Windows (quicker than a package).
 fn check_windows() -> Result<()> {
+    let mut cargo = xwin()?;
+    cargo.args(["build", "--package", "gate", "--target", "x86_64-pc-windows-msvc"]);
+    run(&mut cargo)
+}
+
+/// `cargo xwin`, with the newest LLVM first on the PATH (MSVC's current C++
+/// library wants Clang 19 or newer).
+fn xwin() -> Result<Command> {
     let llvm = newest_llvm().context("no LLVM in /usr/lib/llvm-* (apt install clang-tools-20 lld-20 llvm-20)")?;
     let path = std::env::join_paths(std::iter::once(llvm.join("bin")).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())))?;
     let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cargo
-        .current_dir(root())
-        .env("PATH", path)
-        .env("XWIN_ACCEPT_LICENSE", "1")
-        .args(["xwin", "build", "--package", "gate", "--target", "x86_64-pc-windows-msvc"]);
-    run(&mut cargo)
+    cargo.current_dir(root()).env("PATH", path).env("XWIN_ACCEPT_LICENSE", "1").arg("xwin");
+    Ok(cargo)
 }
 
 /// The highest-numbered /usr/lib/llvm-N that has clang-cl and lld-link.
@@ -158,11 +160,14 @@ fn cef_dir(root: &Path, os: &str, arch: &str) -> Result<PathBuf> {
 }
 
 /// CEF's runtime files: everything in the distribution but what is only for
-/// building against it (headers, the C++ wrapper, CMake, import libraries).
+/// building against it (headers, the C++ wrapper, CMake, import libraries)
+/// and its sample launchers.
 fn copy_cef(cef: &Path, out: &Path) -> Result<()> {
     let build_only = |p: &Path| {
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         matches!(name, "include" | "cmake" | "libcef_dll" | "CMakeLists.txt" | "archive.json" | "chrome-sandbox" | "README.txt" | "LICENSE.txt" | "CREDITS.html")
+            // CEF's sample launchers.
+            || name.starts_with("bootstrap")
             || name.ends_with(".lib")
             || name.ends_with(".pdb")
     };

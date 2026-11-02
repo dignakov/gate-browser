@@ -3,9 +3,11 @@
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        // Compile HLSL shaders
+        // Compile HLSL shaders, unless the renderer compiles them itself.
         #[cfg(not(debug_assertions))]
-        compile_shaders();
+        if std::env::var_os("CARGO_FEATURE_RUNTIME_SHADERS").is_none() {
+            compile_shaders();
+        }
     }
 }
 

@@ -116,21 +116,27 @@ impl WgpuAtlas {
     }
 
     pub fn before_frame(&self) {
-        let (device, queue, copies, completions) = {
+        self.submit();
+        let device = self.0.lock().device.clone();
+        let _ = device.poll(wgpu::PollType::Poll);
+    }
+
+    /// Submits queued uploads and copies; their completions run once the
+    /// GPU finished them.
+    fn submit(&self) -> wgpu::SubmissionIndex {
+        let (queue, copies, completions) = {
             let mut lock = self.0.lock();
             lock.flush_uploads();
             (
-                lock.device.clone(),
                 lock.queue.clone(),
                 lock.take_copies(),
                 std::mem::take(&mut lock.completions),
             )
         };
         // Submitting and polling may run completion callbacks, which may call
-        // back into the atlas: never hold the lock across them.
-        if let Some(copies) = copies {
-            queue.submit([copies]);
-        }
+        // back into the atlas: never hold the lock across them. An empty
+        // submission still carries the queued uploads.
+        let index = queue.submit(copies);
         if !completions.is_empty() {
             queue.on_submitted_work_done(move || {
                 for complete in completions {
@@ -138,7 +144,7 @@ impl WgpuAtlas {
                 }
             });
         }
-        let _ = device.poll(wgpu::PollType::Poll);
+        index
     }
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
@@ -261,6 +267,19 @@ impl PlatformAtlas for WgpuAtlas {
         }
     }
 
+    fn flush(&self, wait: bool) {
+        let index = self.submit();
+        let device = self.0.lock().device.clone();
+        let poll = if wait {
+            wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::from_secs(1)) }
+        } else {
+            wgpu::PollType::Poll
+        };
+        if let Err(error) = device.poll(poll) {
+            log::warn!("flushing atlas updates: {error}");
+        }
+    }
+
     fn update_tile(
         &self,
         key: &AtlasKey,
@@ -375,6 +394,47 @@ impl WgpuAtlasState {
                     "{} bytes cannot hold {rows} rows of {row} bytes, {stride} apart",
                     bytes.len()
                 );
+                // Uploads land before this frame's copies: a copy queued
+                // earlier would overwrite these newer pixels.
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                self.pending_copies.retain(|copy| {
+                    copy.id != tile.texture_id || bounds.intersect(&copy.bounds) != copy.bounds
+                });
+                if format == wgpu::TextureFormat::Bgra8Unorm {
+                    // As they are: the queue copies the rows (strided) into
+                    // its staging memory now, and the write lands with the
+                    // next submission, before its copies, as a queued upload
+                    // would. One copy instead of two.
+                    // After the uploads queued before it, as they would land.
+                    self.flush_uploads();
+                    let Some(texture) = self.storage.get(tile.texture_id) else {
+                        return Ok(false);
+                    };
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: bounds.origin.x.0 as u32,
+                                y: bounds.origin.y.0 as u32,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &bytes[..stride * (rows - 1) + row],
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bytes_per_row),
+                            rows_per_image: None,
+                        },
+                        wgpu::Extent3d {
+                            width: region.size.width.0 as u32,
+                            height: rows as u32,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    return Ok(true);
+                }
                 let mut data = Vec::with_capacity(row * rows);
                 for line in bytes.chunks(stride).take(rows) {
                     data.extend_from_slice(&line[..row]);
@@ -384,12 +444,6 @@ impl WgpuAtlasState {
                         pixel.swap(0, 2);
                     }
                 }
-                // Uploads land before this frame's copies: a copy queued
-                // earlier would overwrite these newer pixels.
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                self.pending_copies.retain(|copy| {
-                    copy.id != tile.texture_id || bounds.intersect(&copy.bounds) != copy.bounds
-                });
                 self.pending_uploads.push(PendingUpload {
                     id: tile.texture_id,
                     bounds,

@@ -1,10 +1,10 @@
 //! A web page as a GPUI view.
 
-use crate::client::{self, Ask, Pixmap, Playback, Reply, Shared};
+use crate::client::{self, Ask, Playback, Reply, Shared};
 use crate::keys;
 use cef::{ImplBrowser as _, ImplBrowserHost as _, ImplFrame as _, *};
 use gpui::{
-    App, Bounds, Context, Corners, DevicePixels, EventEmitter, FocusHandle, Focusable,
+    App, Bounds, Context, Corners, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
     StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px, size,
@@ -40,6 +40,8 @@ pub enum WebEvent {
     Crashed,
     /// New pixels or cursor (internal; not emitted).
     Repaint,
+    /// GPU frames failed; the view falls back to CPU ones (internal).
+    GpuFramesFailed,
     Closed,
 }
 
@@ -51,19 +53,11 @@ pub enum Zoom {
     Reset,
 }
 
-/// GPU-side state of one painted surface.
-#[derive(Default)]
-struct Tile {
-    image: Option<Arc<RenderImage>>,
-}
-
 pub struct WebView {
     shared: Rc<RefCell<Shared>>,
     focus: FocusHandle,
     /// Where the page was last painted, in window coordinates.
     bounds: Rc<Cell<Bounds<Pixels>>>,
-    page_tile: Rc<RefCell<Tile>>,
-    popup_tile: Rc<RefCell<Tile>>,
     /// Buttons held over the page, as CEF event flags.
     buttons: u32,
     focused: bool,
@@ -128,6 +122,7 @@ impl WebView {
         let url = url.as_str();
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
+            shared_texture_enabled: self.takes_gpu_frames() as i32,
             runtime_style: RuntimeStyle::ALLOY,
             ..Default::default()
         };
@@ -154,6 +149,13 @@ impl WebView {
     fn empty(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let shared = Rc::new(RefCell::new(Shared::new()));
         shared.borrow_mut().scale = window.scale_factor();
+        // Frames go straight into the window's atlas as they arrive.
+        shared.borrow_mut().frames = Some(crate::frames::Frames { atlas: window.atlas_handle() });
+        // As GPU buffers, when asked for and the window's GPU can import them.
+        #[cfg(target_os = "linux")]
+        if crate::gpu_frames_wanted() && !crate::gpu_frames::broken() && window.dmabuf_target().is_some() {
+            shared.borrow_mut().gpu = Some(Default::default());
+        }
 
         let weak = cx.entity().downgrade();
         let drain_shared = shared.clone();
@@ -182,8 +184,6 @@ impl WebView {
             shared,
             focus,
             bounds: Rc::default(),
-            page_tile: Rc::default(),
-            popup_tile: Rc::default(),
             buttons: 0,
             focused: false,
             hidden: false,
@@ -377,6 +377,36 @@ impl WebView {
         self.with_host(|h| h.close_browser(1));
     }
 
+    /// Whether this view's browser hands frames over as GPU buffers.
+    fn takes_gpu_frames(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.shared.borrow().gpu.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// GPU frames failed: a browser takes one kind of frame for its life, so
+    /// a new one (loading the same page) takes CPU frames.
+    fn fall_back_to_cpu_frames(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let mut shared = self.shared.borrow_mut();
+            let shared = &mut *shared;
+            if shared.gpu.take().is_none() {
+                return;
+            }
+            if let Some(frames) = &shared.frames {
+                frames.release(&mut shared.page);
+                frames.release(&mut shared.popup);
+            }
+        }
+        if self.asleep || self.closed {
+            return;
+        }
+        self.with_host(|h| h.close_browser(1));
+        self.create_browser();
+    }
+
     /// Runs `f` with the browser, without holding a borrow of the shared
     /// state (CEF may call back into it).
     fn with_browser(&self, f: impl FnOnce(&Browser)) {
@@ -401,6 +431,10 @@ impl WebView {
             match &event {
                 WebEvent::Repaint => {
                     repaint = true;
+                    continue;
+                }
+                WebEvent::GpuFramesFailed => {
+                    self.fall_back_to_cpu_frames();
                     continue;
                 }
                 WebEvent::Created => {
@@ -615,65 +649,36 @@ impl Drop for WebView {
     }
 }
 
-/// Copies a frame's damage into its atlas tile and paints it at `origin`.
-fn paint_frame(
-    frame: &mut Pixmap,
-    tile: &mut Tile,
+/// Paints a surface's atlas tile at `origin`; false when the atlas lost the
+/// tile (its content is gone until a whole new frame arrives).
+fn paint_tile(
+    image: &Arc<RenderImage>,
     origin: Point<Pixels>,
     clip: Bounds<Pixels>,
     corners: Corners<Pixels>,
     scale: f32,
     window: &mut Window,
-) {
-    if frame.width <= 0 || frame.height <= 0 {
-        return;
-    }
-    let pixels = size(DevicePixels(frame.width), DevicePixels(frame.height));
-    let whole = Bounds::new(point(DevicePixels(0), DevicePixels(0)), pixels);
-    if tile.image.as_ref().map(|i| i.size(0)) != Some(pixels) {
-        if let Some(old) = tile.image.take() {
-            let _ = window.drop_image(old);
-        }
-        tile.image = Some(Arc::new(RenderImage::blank(pixels)));
-    }
-    let image = tile.image.clone().unwrap();
-    // A new tile, or one the atlas dropped, needs the whole frame.
-    let created = match window.insert_blank_image(&image, 0) {
-        Ok(created) => created,
+) -> bool {
+    match window.insert_blank_image(image, 0) {
+        Ok(false) => {}
+        Ok(true) => return false,
         Err(error) => {
             tracing::warn!("web frame tile: {error:#}");
-            return;
-        }
-    };
-    let damage = std::mem::take(&mut frame.damage);
-    let regions = if created { vec![whole] } else { damage };
-    let stride = frame.width as u32 * 4;
-    for region in regions {
-        let region = region.intersect(&whole);
-        if region.size.width.0 <= 0 || region.size.height.0 <= 0 {
-            continue;
-        }
-        let start = (region.origin.y.0 as usize * frame.width as usize + region.origin.x.0 as usize) * 4;
-        let update = gpui::AtlasTileUpdate::Pixels { bytes: &frame.pixels[start..], bytes_per_row: stride };
-        match window.update_image(&image, 0, region, update, None) {
-            Ok(true) => {}
-            Ok(false) => tracing::error!("the atlas cannot update web frames in place"),
-            Err(error) => tracing::warn!("web frame upload: {error:#}"),
+            return false;
         }
     }
-    let shown = size(px(frame.width as f32 / scale), px(frame.height as f32 / scale));
-    let bounds = Bounds::new(origin, shown);
+    let pixels = image.size(0);
+    let shown = size(px(pixels.width.0 as f32 / scale), px(pixels.height.0 as f32 / scale));
     window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
-        let _ = window.paint_image(bounds, corners, image, 0, false);
+        let _ = window.paint_image(Bounds::new(origin, shown), corners, image.clone(), 0, false);
     });
+    true
 }
 
 impl Render for WebView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let shared = self.shared.clone();
-        let page_tile = self.page_tile.clone();
-        let popup_tile = self.popup_tile.clone();
         let cursor = shared.borrow().cursor;
         let corners = self.corners;
         div()
@@ -708,12 +713,20 @@ impl Render for WebView {
                     },
                     move |bounds, _, window, _cx| {
                         let scale = window.scale_factor();
-                        let mut shared = shared.borrow_mut();
-                        let shared = &mut *shared;
-                        paint_frame(&mut shared.page, &mut page_tile.borrow_mut(), bounds.origin, bounds, corners, scale, window);
-                        if let Some(rect) = shared.popup_rect.clone() {
-                            let origin = bounds.origin + point(px(rect.x as f32), px(rect.y as f32));
-                            paint_frame(&mut shared.popup, &mut popup_tile.borrow_mut(), origin, bounds, Corners::default(), scale, window);
+                        let shared = shared.borrow();
+                        let mut lost = false;
+                        if let Some(image) = &shared.page.image {
+                            lost |= !paint_tile(image, bounds.origin, bounds, corners, scale, window);
+                        }
+                        let popup_origin = shared.popup_rect.as_ref().map(|r| bounds.origin + point(px(r.x as f32), px(r.y as f32)));
+                        if let (Some(image), Some(origin)) = (&shared.popup.image, popup_origin) {
+                            lost |= !paint_tile(image, origin, bounds, Corners::default(), scale, window);
+                        }
+                        let browser = shared.browser.clone();
+                        drop(shared);
+                        // A tile the atlas dropped needs a whole new frame.
+                        if lost && let Some(host) = browser.as_ref().and_then(|b| b.host()) {
+                            host.invalidate(PaintElementType::VIEW);
                         }
                     },
                 )

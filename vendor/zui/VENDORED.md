@@ -37,3 +37,15 @@ with the new snapshot (keep this file), apply the patch, resolve conflicts.
   Windows (web pages stayed blank).
 - `gpui_windows/src/window.rs`: `zoom()` restores a maximized window, as on
   macOS and Linux; it only ever maximized.
+- `gpui_windows` (`runtime_shaders` feature: `directx_renderer.rs`,
+  `build.rs`, `Cargo.toml`) and `gpui_platform/Cargo.toml`: the Windows
+  shaders compile at startup from HLSL built into the binary, as macOS's
+  `runtime_shaders` does, instead of with fxc.exe at build time. Windows
+  builds then work from Linux (cargo-xwin).
+- `gpui/src/window.rs` (`AtlasHandle`, `Window::atlas_handle`) and
+  `gpui/src/platform.rs` (`PlatformAtlas::flush`): images can be updated
+  outside of painting, from a callback that must finish with its source
+  before returning. `gpui_wgpu/src/wgpu_atlas.rs` implements `flush`.
+- `gpui_wgpu/src/wgpu_atlas.rs`: pixel updates of a BGRA atlas go straight
+  to `Queue::write_texture` (after the uploads queued before them) instead
+  of through an intermediate copy.

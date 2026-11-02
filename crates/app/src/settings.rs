@@ -21,6 +21,10 @@ pub struct Settings {
     pub chrome_opacity: f32,
     /// The glass's blur radius over a wallpaper, in pixels.
     pub blur: f32,
+    /// Pages hand frames over as GPU buffers (no copies through the CPU),
+    /// where the platform can (read at startup). Off until verified: see
+    /// `web`'s gpu_frames module.
+    pub gpu_frames: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +37,7 @@ impl Default for Settings {
             wallpaper_dir: None,
             chrome_opacity: 1.0,
             blur: 30.0,
+            gpu_frames: false,
         }
     }
 }
