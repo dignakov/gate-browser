@@ -64,7 +64,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Workspace::on_zoom_pane))
             .on_action(cx.listener(Workspace::on_rename_space))
             .on_action(cx.listener(Workspace::on_open_settings))
-            .on_action(cx.listener(Workspace::on_open_palette));
+            .on_action(cx.listener(Workspace::on_open_palette))
+            .on_action(cx.listener(Workspace::on_page_zoom_in))
+            .on_action(cx.listener(Workspace::on_page_zoom_out))
+            .on_action(cx.listener(Workspace::on_page_zoom_reset));
 
         self.sync_backdrop(vw, vh, window.scale_factor(), cx);
         let settings = &self.store.settings;
@@ -736,6 +739,7 @@ impl Workspace {
         let (camera, microphone) = v.media();
         let (playback, muted) = (v.playback(), v.muted());
         let asks = v.ask().is_some() || v.crashed();
+        let zoom = v.zoom_percent();
         let header_group: SharedString = format!("pane-header-{pane}").into();
         let button_group = |name: &str| format!("pane-{pane}-{name}");
 
@@ -784,6 +788,23 @@ impl Workspace {
             .when(microphone, |h| h.child(icon_glyph("icons/mic.svg", 13.0).text_color(theme::live())))
             .when(playback != Playback::None, |h| h.child(media_controls("pane", pane, playback, muted, Ink::standard(), cx)))
             .when(asks, |h| h.child(pill("Needs you", theme::needs_you())))
+            // Zoomed: the size shows; a click goes back to 100%.
+            .when(zoom != 100, |h| {
+                h.child(
+                    div()
+                        .id(("pane-zoom-level", pane))
+                        .flex_none()
+                        .px(px(5.))
+                        .rounded(px(4.))
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted())
+                        .bg(theme::wash(0.06))
+                        .hover(|s| s.bg(theme::wash(0.1)).text_color(theme::text()))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| this.zoom_page(Some(pane), web::Zoom::Reset, cx)))
+                        .child(format!("{zoom}%")),
+                )
+            })
             .child(controls)
             .on_mouse_down(
                 MouseButton::Left,
@@ -829,7 +850,8 @@ impl Workspace {
             .bg(theme::surface())
             .overflow_hidden()
             .child(header)
-            .child(div().flex_1().min_h_0().child(view))
+            // Inside the card's border, which frames the page, not covers it.
+            .child(div().flex_1().min_h_0().mx(px(1.)).mb(px(1.)).child(view))
             .when(asks, |card| card.child(self.question(pane, rect, cx)))
             .child(ring)
             .when_some(drop, |card, edge| card.child(drop_highlight(rect, edge)))

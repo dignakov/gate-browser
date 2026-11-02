@@ -19,7 +19,7 @@ mod renderer;
 mod view;
 
 pub use client::{Ask, Playback};
-pub use view::{WebEvent, WebView};
+pub use view::{WebEvent, WebView, Zoom};
 
 use anyhow::{Context as _, Result, bail};
 use cef::CefString;

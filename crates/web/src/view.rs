@@ -43,6 +43,14 @@ pub enum WebEvent {
     Closed,
 }
 
+/// A page zoom step (see [`WebView::zoom`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zoom {
+    In,
+    Out,
+    Reset,
+}
+
 /// GPU-side state of one painted surface.
 #[derive(Default)]
 struct Tile {
@@ -324,6 +332,25 @@ impl WebView {
     pub fn stop(&mut self) {
         self.with_browser(|b| b.stop_load());
     }
+    /// Zooms the page as Chromium does: its steps (25% to 500%), and
+    /// remembered for the site.
+    pub fn zoom(&mut self, zoom: Zoom) {
+        let command = match zoom {
+            Zoom::In => ZoomCommand::IN,
+            Zoom::Out => ZoomCommand::OUT,
+            Zoom::Reset => ZoomCommand::RESET,
+        };
+        self.with_host(|h| h.zoom(command));
+    }
+
+    /// The page's zoom in percent (100: none).
+    pub fn zoom_percent(&self) -> u32 {
+        let mut level = 0.0;
+        self.with_host(|h| level = h.zoom_level());
+        // Chromium's zoom levels are powers of 1.2.
+        (1.2f64.powf(level) * 100.0).round() as u32
+    }
+
     pub fn show_dev_tools(&mut self) {
         // DevTools open in their own native window for now.
         self.with_host(|h| {

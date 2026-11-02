@@ -41,6 +41,9 @@ actions!(
         OpenPalette,
         PaletteUp,
         PaletteDown,
+        PageZoomIn,
+        PageZoomOut,
+        PageZoomReset,
     ]
 );
 
@@ -69,6 +72,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f2", RenameSpace, ctx),
         KeyBinding::new("ctrl-,", OpenSettings, ctx),
         KeyBinding::new("ctrl-shift-p", OpenPalette, ctx),
+        KeyBinding::new("ctrl-=", PageZoomIn, ctx),
+        KeyBinding::new("ctrl-+", PageZoomIn, ctx),
+        KeyBinding::new("ctrl--", PageZoomOut, ctx),
+        KeyBinding::new("ctrl-0", PageZoomReset, ctx),
         KeyBinding::new("up", PaletteUp, Some("Palette")),
         KeyBinding::new("down", PaletteDown, Some("Palette")),
     ]);
@@ -373,7 +380,8 @@ impl Workspace {
     pub(crate) fn add_pane(&mut self, view: Entity<WebView>, window: &mut Window, cx: &mut Context<Self>) -> PaneId {
         let id = self.fresh_id();
         // Pages fill their card below its header: round the bottom.
-        let r = px(theme::PANE_RADIUS);
+        // Inside the card's 1px border, so its curve is one smaller.
+        let r = px(theme::PANE_RADIUS - 1.0);
         view.update(cx, |v, _| v.set_corners(Corners { top_left: px(0.), top_right: px(0.), bottom_left: r, bottom_right: r }));
         let events = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
             this.web_event(id, event, window, cx)
@@ -933,6 +941,25 @@ impl Workspace {
     pub fn on_rename_space(&mut self, _: &RenameSpace, window: &mut Window, cx: &mut Context<Self>) {
         self.start_rename(self.active, window, cx);
     }
+    pub fn on_page_zoom_in(&mut self, _: &PageZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_page(None, web::Zoom::In, cx);
+    }
+    pub fn on_page_zoom_out(&mut self, _: &PageZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_page(None, web::Zoom::Out, cx);
+    }
+    pub fn on_page_zoom_reset(&mut self, _: &PageZoomReset, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_page(None, web::Zoom::Reset, cx);
+    }
+
+    /// Zooms a pane's page (`None`: the focused one).
+    pub fn zoom_page(&mut self, pane: Option<PaneId>, zoom: web::Zoom, cx: &mut Context<Self>) {
+        let Some(pane) = pane.or_else(|| self.active_tab().map(|t| t.focused)) else { return };
+        if let Some(p) = self.panes.get(&pane) {
+            p.view.update(cx, |v, _| v.zoom(zoom));
+        }
+        cx.notify();
+    }
+
     pub fn on_zoom_pane(&mut self, _: &ZoomPane, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(pane) = self.active_tab().map(|t| t.focused) {
             self.toggle_zoom(pane, cx);
