@@ -1,16 +1,11 @@
-//! Project tasks. `cargo xtask package [--target <triple>]` builds Gate for
-//! distribution and lays it out as one folder that runs from anywhere:
+//! Project tasks.
 //!
-//! ```text
-//! dist/gate-<os>-<arch>/
-//!     gate(.exe)              the browser
-//!     libcef.so | libcef.dll  Chromium, and the rest of CEF's runtime files
-//!     locales/  *.pak  icudtl.dat  v8_context_snapshot.bin  ...
-//!     extensions/ubol/        uBlock Origin Lite, the first copy installed
-//!     licenses/               notices for what ships inside
-//! ```
+//! `cargo xtask package [--target <triple>]` builds Gate for distribution:
 //!
-//! plus `dist/gate-<os>-<arch>.tar.gz` (Linux) or `.zip` (Windows).
+//! - Linux: `dist/gate_<version>_<arch>.deb`, Gate on WPE WebKit (built by
+//!   `cargo xtask build-wpe`), installed to /usr/lib/gate.
+//! - Windows: `dist/gate-windows-<arch>.zip`, one folder that runs from
+//!   anywhere: gate.exe, Chromium (CEF), uBlock Origin Lite, licenses/.
 //!
 //! Windows builds natively, or from Linux with cargo-xwin (the MSVC runtime
 //! and Windows SDK) and LLVM's clang-cl and lld-link: GPUI compiles its
@@ -22,6 +17,9 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod wpe;
+use wpe::{build_wpe, wpe_install};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -50,9 +48,12 @@ fn host_target() -> String {
 
 fn package(target: &str) -> Result<()> {
     let windows = target.contains("windows");
-    let os = if windows { "windows" } else if target.contains("linux") { "linux" } else { bail!("no packaging for {target} yet") };
+    ensure!(windows || target.contains("linux"), "no packaging for {target} yet");
     let arch = target.split('-').next().unwrap_or("x86_64");
     let root = root();
+    if !windows {
+        ensure!(wpe_install(&root).join("lib/libWPEWebKit-2.0.so.1").exists(), "WPE WebKit isn't built (cargo xtask build-wpe)");
+    }
 
     let mut cargo = if windows && !cfg!(windows) {
         xwin()?
@@ -64,123 +65,207 @@ fn package(target: &str) -> Result<()> {
     cargo.args(["build", "--package", "gate", "--profile", "dist", "--target", target]);
     run(&mut cargo).context("building Gate")?;
 
-    let name = format!("gate-{os}-{arch}");
-    let out = root.join("dist").join(&name);
-    if out.exists() {
-        fs::remove_dir_all(&out)?;
-    }
-    fs::create_dir_all(&out)?;
+    let archive = if windows { package_windows(&root, target, arch)? } else { package_deb(&root, target, arch)? };
+    println!("{}", archive.display());
+    Ok(())
+}
 
-    let exe = if windows { "gate.exe" } else { "gate" };
-    fs::copy(root.join("target").join(target).join("dist").join(exe), out.join(exe)).context("copying the binary")?;
+/// Notices for what every package ships: Gate's fonts, icons and GPUI.
+const LICENSES: [(&str, &str); 3] = [
+    ("assets/fonts/LICENSE-Geist.txt", "geist-LICENSE.txt"),
+    ("assets/icons/LICENSE-Lucide.txt", "lucide-LICENSE.txt"),
+    ("vendor/zui/LICENSE-APACHE", "zui-gpui-LICENSE-APACHE.txt"),
+];
 
-    let cef = cef_dir(&root, os, arch)?;
-    copy_cef(&cef, &out)?;
-    if !windows {
-        // The distribution's libcef.so carries 1.3 GB of debug info.
-        strip(&out.join("libcef.so"))?;
-    }
-
-    copy_tree(&root.join("extensions/ubol"), &out.join("extensions/ubol"), &|p| p.file_name().is_some_and(|n| n == "_metadata"))?;
-
-    let licenses = out.join("licenses");
-    fs::create_dir_all(&licenses)?;
-    for (from, to) in [
-        (cef.join("CREDITS.html"), "chromium-CREDITS.html"),
-        // CEF's binary downloads leave its license out; kept in the repo.
-        (root.join("licenses/cef-LICENSE.txt"), "cef-LICENSE.txt"),
-        (root.join("extensions/ubol/LICENSE.txt"), "ublock-origin-lite-LICENSE.txt"),
-        (root.join("assets/fonts/LICENSE-Geist.txt"), "geist-LICENSE.txt"),
-        (root.join("assets/icons/LICENSE-Lucide.txt"), "lucide-LICENSE.txt"),
-        (root.join("vendor/zui/LICENSE-APACHE"), "zui-gpui-LICENSE-APACHE.txt"),
-    ] {
+fn copy_licenses(licenses: &Path, files: impl IntoIterator<Item = (PathBuf, &'static str)>) -> Result<()> {
+    fs::create_dir_all(licenses)?;
+    let root = root();
+    for (from, to) in LICENSES.iter().map(|&(from, to)| (root.join(from), to)).chain(files) {
         if from.is_file() {
             fs::copy(&from, licenses.join(to))?;
         } else {
             eprintln!("note: {} is missing; not in licenses/", from.display());
         }
     }
-
-    let archive = if windows {
-        let zip = root.join("dist").join(format!("{name}.zip"));
-        zip_dir(&out, &name, &zip)?;
-        zip
-    } else {
-        let tgz = root.join("dist").join(format!("{name}.tar.gz"));
-        run(Command::new("tar").current_dir(root.join("dist")).args(["-czf"]).arg(&tgz).arg(&name))?;
-        tgz
-    };
-    println!("{}\n{}", out.display(), archive.display());
     Ok(())
 }
 
-/// WPE WebKit, the Linux engine: the release Gate builds against, unpacked
-/// into `third_party/wpe/` and installed to `third_party/wpe/install`.
-const WPE_VERSION: &str = "2.54.2";
-const WPE_SHA256: &str = "f3284e19e47fcb5ac8c63c2e1c113dbd65b2423eb8a545f5b345707829004f56";
+/// Windows: Gate on Chromium (CEF), as one folder that runs from anywhere,
+/// zipped (`dist/gate-windows-<arch>.zip`).
+fn package_windows(root: &Path, target: &str, arch: &str) -> Result<PathBuf> {
+    let name = format!("gate-windows-{arch}");
+    let out = root.join("dist").join(&name);
+    if out.exists() {
+        fs::remove_dir_all(&out)?;
+    }
+    fs::create_dir_all(&out)?;
+    fs::copy(root.join("target").join(target).join("dist/gate.exe"), out.join("gate.exe")).context("copying the binary")?;
 
-/// Builds WPE WebKit with only what Gate uses: the WPEPlatform API (Gate
-/// implements its own platform, so WPE's Wayland and DRM ones are off),
-/// media through GStreamer, the PDF viewer.
-fn build_wpe() -> Result<()> {
-    let dir = root().join("third_party/wpe");
-    fs::create_dir_all(&dir)?;
-    let tarball = dir.join(format!("wpewebkit-{WPE_VERSION}.tar.xz"));
-    if !tarball.is_file() {
-        run(Command::new("curl")
-            .current_dir(&dir)
-            .args(["-fL", "-o"])
-            .arg(&tarball)
-            .arg(format!("https://wpewebkit.org/releases/wpewebkit-{WPE_VERSION}.tar.xz")))?;
+    let cef = cef_dir(root, "windows", arch)?;
+    copy_cef(&cef, &out)?;
+    copy_tree(&root.join("extensions/ubol"), &out.join("extensions/ubol"), &|p| p.file_name().is_some_and(|n| n == "_metadata"))?;
+    copy_licenses(
+        &out.join("licenses"),
+        [
+            (cef.join("CREDITS.html"), "chromium-CREDITS.html"),
+            // CEF's binary downloads leave its license out; kept in the repo.
+            (root.join("licenses/cef-LICENSE.txt"), "cef-LICENSE.txt"),
+            (root.join("extensions/ubol/LICENSE.txt"), "ublock-origin-lite-LICENSE.txt"),
+        ],
+    )?;
+
+    let zip = root.join("dist").join(format!("{name}.zip"));
+    zip_dir(&out, &name, &zip)?;
+    Ok(zip)
+}
+
+/// Linux: Gate on WPE WebKit as a Debian package
+/// (`dist/gate_<version>_<arch>.deb`). WebKit finds its processes and data
+/// relative to its library (xtask/patches/wpe-relocatable.patch), so it
+/// lives privately in /usr/lib/gate; the system provides the rest.
+fn package_deb(root: &Path, target: &str, arch: &str) -> Result<PathBuf> {
+    let deb_arch = match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => bail!("no Debian architecture for {other}"),
+    };
+    let version = gate_version(root)?;
+    let name = format!("gate_{version}_{deb_arch}");
+    let stage = root.join("dist").join(&name);
+    if stage.exists() {
+        fs::remove_dir_all(&stage)?;
     }
-    let sum = Command::new("sha256sum").arg(&tarball).output().context("running sha256sum")?;
-    let sum = String::from_utf8_lossy(&sum.stdout);
-    ensure!(sum.split_whitespace().next() == Some(WPE_SHA256), "{} doesn't match its SHA-256", tarball.display());
-    let source = dir.join(format!("wpewebkit-{WPE_VERSION}"));
-    if !source.is_dir() {
-        run(Command::new("tar").current_dir(&dir).arg("-xJf").arg(&tarball))?;
+    let app = stage.join("usr/lib/gate");
+    fs::create_dir_all(app.join("lib"))?;
+
+    let dist = root.join("target").join(target).join("dist");
+    fs::copy(dist.join("gate"), app.join("gate")).context("copying the binary")?;
+    fs::copy(built_helper(&dist)?, app.join("gate-wpe")).context("copying the WPE helper")?;
+    let wpe = wpe_install(root);
+    fs::copy(wpe.join("lib/libWPEWebKit-2.0.so.1"), app.join("lib/libWPEWebKit-2.0.so.1"))?;
+    for dir in ["lib/wpe-webkit-2.0", "libexec/wpe-webkit-2.0", "share/wpe-webkit-2.0"] {
+        copy_tree(&wpe.join(dir), &app.join(dir), &|_| false)?;
     }
-    let build = dir.join("build");
-    let install = dir.join("install");
-    let off = [
-        "ENABLE_WPE_LEGACY_API",
-        "ENABLE_WPE_PLATFORM_DRM",
-        "ENABLE_WPE_PLATFORM_WAYLAND",
-        "ENABLE_WPE_QT_API",
-        "ENABLE_DOCUMENTATION",
-        "ENABLE_INTROSPECTION",
-        "ENABLE_JOURNALD_LOG",
-        "ENABLE_BUBBLEWRAP_SANDBOX",
-        "ENABLE_SPEECH_SYNTHESIS",
-        "ENABLE_SPELLCHECK",
-        "ENABLE_GAMEPAD",
-        "ENABLE_WEBDRIVER",
-        "USE_ATK",
-        "USE_FLITE",
-        "USE_JPEGXL",
-        "USE_LIBBACKTRACE",
-        "USE_LIBHYPHEN",
-        "USE_SYSPROF_CAPTURE",
-    ];
-    let mut configure = Command::new("cmake");
-    configure
-        .arg("-S")
-        .arg(&source)
-        .arg("-B")
-        .arg(&build)
-        .args(["-G", "Ninja", "-DPORT=WPE", "-DCMAKE_BUILD_TYPE=Release", "-DENABLE_WPE_PLATFORM=ON", "-DENABLE_WPE_PLATFORM_HEADLESS=ON"])
-        .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install.display()))
-        // Its processes (libexec/wpe-webkit-2.0) and libraries find each
-        // other wherever the install goes.
-        .arg("-DCMAKE_INSTALL_RPATH=$ORIGIN/../../lib;$ORIGIN/../lib;$ORIGIN")
-        .args(off.iter().map(|o| format!("-D{o}=OFF")));
-    run(&mut configure).context("configuring WPE WebKit (missing -dev packages show above)")?;
-    // WebKit builds for an hour or two; GATE_JOBS caps the parallelism.
-    let jobs = std::env::var("GATE_JOBS").unwrap_or_else(|_| "4".into());
-    run(Command::new("cmake").arg("--build").arg(&build).args(["-j", &jobs])).context("building WPE WebKit")?;
-    run(Command::new("cmake").arg("--install").arg(&build)).context("installing WPE WebKit")?;
-    println!("{}", install.display());
-    Ok(())
+    let elves = ["gate-wpe", "lib/libWPEWebKit-2.0.so.1", "lib/wpe-webkit-2.0/injected-bundle/libWPEInjectedBundle.so"]
+        .into_iter()
+        .map(|f| app.join(f))
+        .chain(["WPEWebProcess", "WPENetworkProcess", "WPEGPUProcess"].into_iter().map(|p| app.join("libexec/wpe-webkit-2.0").join(p)))
+        .collect::<Vec<_>>();
+    for elf in &elves {
+        strip(elf)?;
+    }
+
+    fs::create_dir_all(stage.join("usr/bin"))?;
+    std::os::unix::fs::symlink("../lib/gate/gate", stage.join("usr/bin/gate"))?;
+    let applications = stage.join("usr/share/applications");
+    fs::create_dir_all(&applications)?;
+    fs::write(applications.join("gate.desktop"), DESKTOP_ENTRY)?;
+    copy_licenses(
+        &stage.join("usr/share/doc/gate/licenses"),
+        wpe::NOTICES.map(|(notice, name)| (wpe.join("share/doc/wpe-webkit").join(notice), name)),
+    )?;
+
+    let mut binaries = elves;
+    binaries.push(app.join("gate"));
+    // dpkg-shlibdeps resolves $ORIGIN within a tree with DEBIAN/.
+    fs::create_dir_all(stage.join("DEBIAN"))?;
+    let depends = shlib_depends(root, &app.join("lib"), &binaries)?;
+    let size_kb = tree_size(&stage)? / 1024;
+    fs::write(
+        stage.join("DEBIAN/control"),
+        format!(
+            "Package: gate\n\
+             Version: {version}\n\
+             Architecture: {deb_arch}\n\
+             Maintainer: Gate <https://github.com/dignakov/gate-browser>\n\
+             Installed-Size: {size_kb}\n\
+             Depends: {depends}, glib-networking\n\
+             Recommends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-gl, gstreamer1.0-libav, xdg-desktop-portal\n\
+             Suggests: gstreamer1.0-plugins-bad\n\
+             Section: web\n\
+             Priority: optional\n\
+             Homepage: https://github.com/dignakov/gate-browser\n\
+             Description: Web browser on WebKit\n \
+             Gate is a keyboard-first web browser built with GPUI on WPE WebKit.\n"
+        ),
+    )?;
+
+    let deb = root.join("dist").join(format!("{name}.deb"));
+    run(Command::new("dpkg-deb").args(["--root-owner-group", "-Zxz", "--build"]).arg(&stage).arg(&deb)).context("building the .deb")?;
+    Ok(deb)
+}
+
+const DESKTOP_ENTRY: &str = "[Desktop Entry]
+Type=Application
+Name=Gate
+GenericName=Web Browser
+Comment=Browse the web
+Exec=gate %U
+Icon=web-browser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=gate
+StartupNotify=true
+";
+
+/// The app's version (crates/app/Cargo.toml).
+fn gate_version(root: &Path) -> Result<String> {
+    let manifest = fs::read_to_string(root.join("crates/app/Cargo.toml"))?;
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \"")?.strip_suffix('"'))
+        .map(str::to_string)
+        .context("crates/app/Cargo.toml has no version")
+}
+
+/// The `gate-wpe` the web crate's build script made for this build (the
+/// newest, should older builds be around).
+fn built_helper(dist: &Path) -> Result<PathBuf> {
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = fs::read_dir(dist.join("build"))?
+        .filter_map(|e| e.ok().map(|e| e.path().join("out/gate-wpe")))
+        .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p)))
+        .collect();
+    found.sort();
+    found.pop().map(|(_, p)| p).context("the build made no gate-wpe")
+}
+
+/// The packages `binaries` need from the system, as Debian's dependency list
+/// (dpkg-shlibdeps; `private` holds the libraries the package brings).
+fn shlib_depends(root: &Path, private: &Path, binaries: &[PathBuf]) -> Result<String> {
+    // dpkg-shlibdeps runs in a source package; a stub stands in for one.
+    let work = root.join("dist/.shlibdeps");
+    fs::create_dir_all(work.join("debian"))?;
+    fs::write(work.join("debian/control"), "Source: gate\n\nPackage: gate\nArchitecture: any\n")?;
+    let out = Command::new("dpkg-shlibdeps")
+        .current_dir(&work)
+        .arg("-O")
+        .arg(format!("-l{}", private.display()))
+        .args(binaries.iter().map(|b| {
+            let mut arg = std::ffi::OsString::from("-e");
+            arg.push(b);
+            arg
+        }))
+        .output()
+        .context("running dpkg-shlibdeps (apt install dpkg-dev)")?;
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    ensure!(out.status.success(), "dpkg-shlibdeps failed");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().find_map(|l| l.strip_prefix("shlibs:Depends=")).map(str::to_string).context("dpkg-shlibdeps gave no Depends")
+}
+
+fn tree_size(dir: &Path) -> Result<u64> {
+    let mut total = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            total += tree_size(&entry.path())?;
+        } else if kind.is_file() {
+            total += entry.metadata()?.len();
+        }
+    }
+    Ok(total)
 }
 
 /// Cross-builds a debug Gate for Windows (quicker than a package).

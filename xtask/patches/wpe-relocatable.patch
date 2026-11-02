@@ -1,0 +1,280 @@
+--- a/Source/WTF/wtf/PlatformWPE.cmake
++++ b/Source/WTF/wtf/PlatformWPE.cmake
+@@ -12,6 +12,7 @@
+     glib/GMallocString.cpp
+     glib/GRefPtr.cpp
+     glib/GResources.cpp
++    glib/InstallPrefix.cpp
+     glib/GSocketMonitor.cpp
+     glib/GSpanExtras.cpp
+     glib/RunLoopGLib.cpp
+@@ -62,6 +63,7 @@
+     glib/GMallocString.h
+     glib/GRefPtr.h
+     glib/GResources.h
++    glib/InstallPrefix.h
+     glib/GSocketMonitor.h
+     glib/GSpanExtras.h
+     glib/GThreadSafeWeakPtr.h
+@@ -91,6 +93,8 @@
+ 
+ list(APPEND WTF_PRIVATE_DEFINITIONS
+     PKGDATADIR="${CMAKE_INSTALL_FULL_DATADIR}/wpe-webkit-${WPE_API_VERSION}"
++    WEBKIT_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}"
++    WEBKIT_LIB_INSTALL_DIR="${LIB_INSTALL_DIR}"
+ )
+ 
+ if (ENABLE_JOURNALD_LOG)
+--- a/Source/WTF/wtf/glib/GResources.cpp
++++ b/Source/WTF/wtf/glib/GResources.cpp
+@@ -23,6 +23,8 @@
+ #if USE(GLIB)
+ 
+ #include <mutex>
++#include <wtf/glib/InstallPrefix.h>
++#include <wtf/text/CString.h>
+ #include <wtf/glib/GRefPtr.h>
+ #include <wtf/glib/GUniquePtr.h>
+ 
+@@ -34,7 +36,8 @@
+ {
+     static std::once_flag onceFlag;
+     std::call_once(onceFlag, [] {
+-        const char* dataDir = PKGDATADIR;
++        CString installedDataDir = WTF::relocatedInstallPath(PKGDATADIR);
++        const char* dataDir = installedDataDir.data();
+         GUniqueOutPtr<GError> error;
+ 
+         const char* path = g_getenv("WEBKIT_INSPECTOR_RESOURCES_PATH");
+--- a/Source/WebKit/Shared/glib/ProcessExecutablePathGLib.cpp
++++ b/Source/WebKit/Shared/glib/ProcessExecutablePathGLib.cpp
+@@ -29,6 +29,7 @@
+ 
+ #include <glib.h>
+ #include <wtf/FileSystem.h>
++#include <wtf/glib/InstallPrefix.h>
+ 
+ namespace WebKit {
+ 
+@@ -60,7 +61,7 @@
+     }
+ #endif
+ 
+-    return FileSystem::pathByAppendingComponent(FileSystem::stringFromFileSystemRepresentation(PKGLIBEXECDIR), processName);
++    return FileSystem::pathByAppendingComponent(FileSystem::stringFromFileSystemRepresentation(WTF::relocatedInstallPath(PKGLIBEXECDIR).data()), processName);
+ }
+ 
+ String executablePathOfWebProcess()
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
+@@ -74,6 +74,7 @@
+ #include <wtf/TZoneMallocInlines.h>
+ #include <wtf/URLParser.h>
+ #include <wtf/glib/GSpanExtras.h>
++#include <wtf/glib/InstallPrefix.h>
+ #include <wtf/glib/WTFGType.h>
+ #include <wtf/text/CString.h>
+ 
+@@ -347,8 +348,8 @@
+     if (bundleDirectory && g_file_test(bundleDirectory, G_FILE_TEST_IS_DIR))
+         return bundleDirectory;
+ 
+-    static const char* injectedBundlePath = PKGLIBDIR G_DIR_SEPARATOR_S "injected-bundle" G_DIR_SEPARATOR_S;
+-    return injectedBundlePath;
++    static NeverDestroyed<CString> injectedBundlePath = WTF::relocatedInstallPath(PKGLIBDIR G_DIR_SEPARATOR_S "injected-bundle" G_DIR_SEPARATOR_S);
++    return injectedBundlePath->data();
+ }
+ 
+ static void webkitWebContextGetProperty(GObject* object, guint propID, GValue* value, GParamSpec* paramSpec)
+@@ -513,7 +514,7 @@
+ 
+     GObjectClass* gObjectClass = G_OBJECT_CLASS(webContextClass);
+ 
+-    bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR);
++    bindtextdomain(GETTEXT_PACKAGE, WTF::relocatedInstallPath(LOCALEDIR).data());
+     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8");
+ 
+     s_serviceWorkerNotificationProvider = makeUnique<WebKitNotificationProvider>(&WebNotificationManagerProxy::serviceWorkerManagerSingleton(), nullptr);
+--- a/Source/WebKit/UIProcess/Launcher/glib/BubblewrapLauncher.cpp
++++ b/Source/WebKit/UIProcess/Launcher/glib/BubblewrapLauncher.cpp
+@@ -34,6 +34,7 @@
+ #include <wtf/glib/GRefPtr.h>
+ #include <wtf/glib/GSpanExtras.h>
+ #include <wtf/glib/GUniquePtr.h>
++#include <wtf/glib/InstallPrefix.h>
+ #include <wtf/glib/Sandbox.h>
+ #include <wtf/text/CStringView.h>
+ #include <wtf/text/MakeString.h>
+@@ -821,14 +822,14 @@
+ 
+         "--ro-bind-try", "/usr/share", "/usr/share",
+         "--ro-bind-try", "/usr/local/share", "/usr/local/share",
+-        "--ro-bind-try", DATADIR, DATADIR,
++        "--ro-bind-try", WTF::relocatedInstallPath(DATADIR), WTF::relocatedInstallPath(DATADIR),
+ 
+         // We only grant access to the libdirs webkit is built with and
+         // guess system libdirs. This will always have some edge cases.
+         "--ro-bind-try", "/lib", "/lib",
+         "--ro-bind-try", "/usr/lib", "/usr/lib",
+         "--ro-bind-try", "/usr/local/lib", "/usr/local/lib",
+-        "--ro-bind-try", LIBDIR, LIBDIR,
++        "--ro-bind-try", WTF::relocatedInstallPath(LIBDIR), WTF::relocatedInstallPath(LIBDIR),
+ #if defined(WEBKIT_SWIFT_STDLIB_LIBRARY_PATH)
+         "--ro-bind-try", WEBKIT_SWIFT_STDLIB_LIBRARY_PATH, WEBKIT_SWIFT_STDLIB_LIBRARY_PATH,
+ #endif
+@@ -842,7 +843,7 @@
+         "--ro-bind-try", "/usr/local/lib32", "/usr/local/lib32",
+ #endif
+ 
+-        "--ro-bind-try", PKGLIBEXECDIR, PKGLIBEXECDIR,
++        "--ro-bind-try", WTF::relocatedInstallPath(PKGLIBEXECDIR), WTF::relocatedInstallPath(PKGLIBEXECDIR),
+     };
+ 
+     if (enableDebugPermissions()) {
+--- a/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
++++ b/Source/WebKit/WPEPlatform/wpe/WPEExtensions.cpp
+@@ -30,6 +30,8 @@
+ #include <gio/gio.h>
+ #include <mutex>
+ #include <wtf/glib/GUniquePtr.h>
++#include <wtf/glib/InstallPrefix.h>
++#include <wtf/text/CString.h>
+ 
+ #if ENABLE(WPE_PLATFORM_DRM)
+ #include "wpe/drm/WPEDisplayDRM.h"
+@@ -66,7 +68,7 @@
+                 g_io_modules_scan_all_in_directory_with_scope(paths.get()[i], scope);
+         }
+ 
+-        g_io_modules_scan_all_in_directory_with_scope(WPE_PLATFORM_MODULE_DIR, scope);
++        g_io_modules_scan_all_in_directory_with_scope(WTF::relocatedInstallPath(WPE_PLATFORM_MODULE_DIR).data(), scope);
+         g_io_module_scope_free(scope);
+ 
+         // Initialize types of builtin extensions.
+--- /dev/null
++++ b/Source/WTF/wtf/glib/InstallPrefix.h
+@@ -0,0 +1,38 @@
++/*
++ * Copyright (C) 2026 Gate contributors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#pragma once
++
++#include <wtf/text/CString.h>
++
++namespace WTF {
++
++// `path`, a path under the install prefix WebKit was built for, under the
++// prefix its library is installed in now: an install can be moved.
++WTF_EXPORT_PRIVATE CString relocatedInstallPath(const char* path);
++
++} // namespace WTF
++
++using WTF::relocatedInstallPath;
+--- /dev/null
++++ b/Source/WTF/wtf/glib/InstallPrefix.cpp
+@@ -0,0 +1,83 @@
++/*
++ * Copyright (C) 2026 Gate contributors
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "InstallPrefix.h"
++
++#include <dlfcn.h>
++#include <limits.h>
++#include <mutex>
++#include <stdlib.h>
++#include <string.h>
++#include <wtf/NeverDestroyed.h>
++#include <wtf/glib/GUniquePtr.h>
++
++WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN
++
++namespace WTF {
++
++static constexpr size_t builtPrefixLength = sizeof(WEBKIT_INSTALL_PREFIX) - 1;
++
++// Where the install prefix is now: the directory holding the library this
++// code is in, less the library directory's place under the prefix.
++static const CString& installPrefix()
++{
++    static LazyNeverDestroyed<CString> prefix;
++    static std::once_flag onceFlag;
++    std::call_once(onceFlag, [] {
++        prefix.construct(WEBKIT_INSTALL_PREFIX);
++        const char* libraryDirectory = WEBKIT_LIB_INSTALL_DIR;
++        if (strncmp(libraryDirectory, WEBKIT_INSTALL_PREFIX, builtPrefixLength))
++            return;
++        const char* libraryUnderPrefix = libraryDirectory + builtPrefixLength;
++
++        Dl_info info;
++        if (!dladdr(reinterpret_cast<void*>(&installPrefix), &info) || !info.dli_fname)
++            return;
++        char* library = realpath(info.dli_fname, nullptr);
++        if (!library)
++            return;
++        GUniquePtr<char> directory(g_path_get_dirname(library));
++        free(library);
++        size_t length = strlen(directory.get());
++        size_t underLength = strlen(libraryUnderPrefix);
++        if (length < underLength || strcmp(directory.get() + length - underLength, libraryUnderPrefix))
++            return;
++        prefix.get() = CString(std::span<const char>(directory.get(), length - underLength));
++    });
++    return prefix.get();
++}
++
++CString relocatedInstallPath(const char* path)
++{
++    if (strncmp(path, WEBKIT_INSTALL_PREFIX, builtPrefixLength) || (path[builtPrefixLength] && path[builtPrefixLength] != '/'))
++        return path;
++    GUniquePtr<char> relocated(g_strconcat(installPrefix().data(), path + builtPrefixLength, nullptr));
++    return relocated.get();
++}
++
++} // namespace WTF
++
++WTF_ALLOW_UNSAFE_BUFFER_USAGE_END

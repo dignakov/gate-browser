@@ -2,19 +2,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let dir = std::env::var("DEP_CEF_DLL_WRAPPER_CEF_DIR").expect("cef-dll-sys reports where the CEF distribution is");
-    println!("cargo::rustc-env=OPUS_CEF_DIR={dir}");
-    println!("cargo::metadata=CEF_DIR={dir}");
     println!("cargo::rustc-check-cfg=cfg(gate_wpe)");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
-        build_wpe_helper();
+    let cef = std::env::var_os("CARGO_FEATURE_CEF").is_some();
+    if cef {
+        let dir = std::env::var("DEP_CEF_DLL_WRAPPER_CEF_DIR").expect("cef-dll-sys reports where the CEF distribution is");
+        println!("cargo::rustc-env=OPUS_CEF_DIR={dir}");
+        println!("cargo::metadata=CEF_DIR={dir}");
+    }
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && !build_wpe_helper() && !cef {
+        panic!("Linux runs on WPE WebKit: build it first (cargo xtask build-wpe), or add Chromium (--features web/cef)");
     }
 }
 
 /// Builds the WPE WebKit helper (`gate-wpe`) against the WPE WebKit that
-/// `cargo xtask build-wpe` installs (or `GATE_WPE_PREFIX`). Without it, or
-/// with `GATE_WPE=0`, Gate runs on CEF alone.
-fn build_wpe_helper() {
+/// `cargo xtask build-wpe` installs (or `GATE_WPE_PREFIX`): whether it did.
+/// `GATE_WPE=0` leaves it out (a Linux build with Chromium only).
+fn build_wpe_helper() -> bool {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let source = manifest.join("src/engine/wpe/helper.c");
     let media = manifest.join("src/js/media.js");
@@ -23,7 +26,7 @@ fn build_wpe_helper() {
     println!("cargo::rerun-if-env-changed=GATE_WPE");
     println!("cargo::rerun-if-env-changed=GATE_WPE_PREFIX");
     if std::env::var("GATE_WPE").as_deref() == Ok("0") {
-        return;
+        return false;
     }
     let prefix = std::env::var_os("GATE_WPE_PREFIX")
         .map(PathBuf::from)
@@ -34,8 +37,8 @@ fn build_wpe_helper() {
         .filter(|d| d.is_dir())
         .collect();
     if pkgconfig.is_empty() {
-        println!("cargo::warning=WPE WebKit not found at {} (cargo xtask build-wpe); Gate runs on CEF only", prefix.display());
-        return;
+        println!("cargo::warning=WPE WebKit not found at {} (cargo xtask build-wpe)", prefix.display());
+        return false;
     }
     println!("cargo::rerun-if-changed={}", pkgconfig[0].display());
     let mut search = std::env::join_paths(&pkgconfig).unwrap();
@@ -50,10 +53,13 @@ fn build_wpe_helper() {
     let mut args = vec!["--cflags", "--libs"];
     args.extend(packages);
     let Some(flags) = pkg(&args) else {
-        println!("cargo::warning=WPE WebKit's development files are incomplete (pkg-config failed); Gate runs on CEF only");
-        return;
+        println!("cargo::warning=WPE WebKit's development files are incomplete (pkg-config failed)");
+        return false;
     };
-    let libdir = pkg(&["--variable=libdir", "wpe-webkit-2.0"]).unwrap_or_default();
+    let Some(libdir) = pkg(&["--variable=libdir", "wpe-webkit-2.0"]) else {
+        println!("cargo::warning=pkg-config gave no libdir for wpe-webkit-2.0");
+        return false;
+    };
 
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     write_c_string(&out.join("gate_media_js.h"), "MEDIA_JS", &std::fs::read(&media).unwrap());
@@ -66,15 +72,21 @@ fn build_wpe_helper() {
         .arg("-o")
         .arg(&helper)
         .args(flags.split_whitespace())
-        .arg(format!("-Wl,-rpath,{libdir}"))
+        // WebKit is in lib/ beside the helper: in a package, and here, where
+        // lib/ is the install it built against.
+        .arg("-Wl,-rpath,$ORIGIN/lib")
         .arg("-lm")
         .status()
         .expect("a C compiler builds the WPE helper");
     if !status.success() {
         panic!("the WPE helper did not compile (GATE_WPE=0 builds without it)");
     }
+    let lib = out.join("lib");
+    let _ = std::fs::remove_file(&lib);
+    std::os::unix::fs::symlink(&libdir, &lib).expect("linking lib/ beside the helper");
     println!("cargo::rustc-env=GATE_WPE_HELPER={}", helper.display());
     println!("cargo::rustc-cfg=gate_wpe");
+    true
 }
 
 /// `source` as a C string constant `name`.

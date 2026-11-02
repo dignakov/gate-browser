@@ -98,15 +98,6 @@ fn gpu_frames_wanted() -> bool {
 /// The extensions [`init`] was asked to load.
 static EXTENSIONS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 
-/// See [`crate::extension_id`].
-pub(crate) fn extension_id(dir: &Path) -> String {
-    use sha2::{Digest as _, Sha256};
-    // Chromium hashes the path made absolute with symlinks resolved.
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    let hash = Sha256::digest(dir.as_os_str().as_encoded_bytes());
-    hash[..16].iter().flat_map(|b| [b >> 4, b & 15]).map(|n| (b'a' + n) as char).collect()
-}
-
 thread_local! {
     /// Arguments of later launches, waiting for the app to take them.
     static RELAUNCHES: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };

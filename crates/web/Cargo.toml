@@ -8,10 +8,15 @@ publish.workspace = true
 # can point its rpath at libcef.so.
 links = "opus_cef"
 
+[features]
+# Chromium (CEF). Windows and macOS builds have it; Linux runs on WPE WebKit
+# and can add it (`--features web/cef`, then `GATE_ENGINE=cef`).
+cef = ["dep:cef", "dep:cef-dll-sys"]
+
 [dependencies]
-cef.workspace = true
+cef = { workspace = true, optional = true }
 # Direct dependency only to read its `CEF_DIR` build metadata.
-cef-dll-sys = "=156.3.0"
+cef-dll-sys = { version = "=156.3.0", optional = true }
 gpui.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

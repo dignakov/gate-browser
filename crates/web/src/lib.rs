@@ -55,6 +55,7 @@ pub enum Started {
 /// starts threads: `Some(code)` means exit with `code`.
 pub fn run_helper_process() -> Option<i32> {
     match engine::engine() {
+        #[cfg(feature = "cef")]
         engine::Engine::Cef => engine::cef::run_helper_process(),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => None,
@@ -65,9 +66,11 @@ pub fn run_helper_process() -> Option<i32> {
 /// `profile` holds cookies, cache and storage; one process at a time owns it.
 /// `extensions`: unpacked extension folders to load (see [`extension_id`]).
 /// `gpu_frames`: pages hand frames over as GPU buffers where the platform
-/// can; otherwise as pixels through the CPU.
+/// can; otherwise as pixels through the CPU. (Both are Chromium's.)
+#[cfg_attr(not(feature = "cef"), allow(unused_variables))]
 pub fn init(profile: &Path, extensions: &[PathBuf], gpu_frames: bool, cx: &mut gpui::App) -> Result<Started> {
     match engine::engine() {
+        #[cfg(feature = "cef")]
         engine::Engine::Cef => engine::cef::init(profile, extensions, gpu_frames, cx),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::init(profile, cx),
@@ -77,6 +80,7 @@ pub fn init(profile: &Path, extensions: &[PathBuf], gpu_frames: bool, cx: &mut g
 /// The engine pages run on, in words ("Chromium", "WebKit").
 pub fn engine_name() -> &'static str {
     match engine::engine() {
+        #[cfg(feature = "cef")]
         engine::Engine::Cef => "Chromium",
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => "WebKit",
@@ -87,13 +91,18 @@ pub fn engine_name() -> &'static str {
 /// `chrome-extension://<id>/`): the first 128 bits of the SHA-256 of its
 /// absolute path, as letters a–p. `dir` must be the path [`init`] got.
 pub fn extension_id(dir: &Path) -> String {
-    engine::cef::extension_id(dir)
+    use sha2::{Digest as _, Sha256};
+    // Chromium hashes the path made absolute with symlinks resolved.
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let hash = Sha256::digest(dir.as_os_str().as_encoded_bytes());
+    hash[..16].iter().flat_map(|b| [b >> 4, b & 15]).map(|n| (b'a' + n) as char).collect()
 }
 
 /// Calls `handler` with the arguments (not switches) of every later launch
 /// on the same profile, which hands them here and exits.
 pub fn on_relaunch(handler: impl Fn(Vec<String>, &mut gpui::App) + 'static) {
     match engine::engine() {
+        #[cfg(feature = "cef")]
         engine::Engine::Cef => engine::cef::on_relaunch(handler),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::on_relaunch(handler),
@@ -104,6 +113,7 @@ pub fn on_relaunch(handler: impl Fn(Vec<String>, &mut gpui::App) + 'static) {
 /// light one. Before the first page or after: later pages follow it too.
 pub fn set_dark_mode(dark: bool) {
     match engine::engine() {
+        #[cfg(feature = "cef")]
         engine::Engine::Cef => engine::cef::set_dark_mode(dark),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::set_dark_mode(dark),
@@ -113,6 +123,7 @@ pub fn set_dark_mode(dark: bool) {
 /// Shuts the engine down. Every [`WebView`] must have been closed.
 pub fn shutdown() {
     match engine::engine() {
+        #[cfg(feature = "cef")]
         engine::Engine::Cef => engine::cef::shutdown(),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::shutdown(),

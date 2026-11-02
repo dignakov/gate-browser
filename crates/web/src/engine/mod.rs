@@ -3,6 +3,7 @@
 //! [`Page`], and reports what pages do as [`PageEvent`]s on a channel (which
 //! also works from an engine's own threads).
 
+#[cfg(feature = "cef")]
 pub(crate) mod cef;
 #[cfg(gate_wpe)]
 pub(crate) mod wpe;
@@ -40,8 +41,8 @@ pub(crate) enum PageEvent {
     Repaint,
     /// The engine wants a turn with the page on the main thread
     /// ([`Page::pump`]): work its callbacks couldn't do in place. (Only
-    /// Linux's engines need one so far.)
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// Chromium on Linux needs one so far.)
+    #[cfg_attr(not(all(target_os = "linux", feature = "cef")), allow(dead_code))]
     Pump,
     Closed,
 }
@@ -81,7 +82,11 @@ pub(crate) enum Input<'a> {
     MouseMove { at: Point<f32>, modifiers: Modifiers },
     MouseLeave,
     Scroll { at: Point<f32>, delta: ScrollDelta, modifiers: Modifiers },
-    KeyDown { keystroke: &'a Keystroke, repeat: bool },
+    KeyDown {
+        keystroke: &'a Keystroke,
+        #[cfg_attr(not(feature = "cef"), allow(dead_code))]
+        repeat: bool,
+    },
     KeyUp { keystroke: &'a Keystroke },
 }
 
@@ -125,27 +130,34 @@ pub(crate) trait Page {
 /// The engines Gate can run on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Engine {
+    #[cfg(feature = "cef")]
     Cef,
     #[cfg(gate_wpe)]
     Wpe,
 }
 
-/// This run's engine: WPE WebKit on Linux when built with it, unless
-/// `GATE_ENGINE=cef`; Chromium elsewhere.
+/// This run's engine: WPE WebKit on Linux, Chromium elsewhere. A Linux
+/// build with both (the `cef` feature) runs Chromium with `GATE_ENGINE=cef`.
 pub(crate) fn engine() -> Engine {
-    static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
-    *ENGINE.get_or_init(|| {
-        #[cfg(gate_wpe)]
-        if std::env::var("GATE_ENGINE").as_deref() != Ok("cef") {
-            return Engine::Wpe;
-        }
+    #[cfg(all(gate_wpe, feature = "cef"))]
+    {
+        static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+        *ENGINE.get_or_init(|| if std::env::var("GATE_ENGINE").as_deref() == Ok("cef") { Engine::Cef } else { Engine::Wpe })
+    }
+    #[cfg(all(gate_wpe, not(feature = "cef")))]
+    {
+        Engine::Wpe
+    }
+    #[cfg(not(gate_wpe))]
+    {
         Engine::Cef
-    })
+    }
 }
 
 /// A page for `url` in this run's engine.
 pub(crate) fn new_page(url: &str, events: Events, window: &mut Window) -> Box<dyn Page> {
     match engine() {
+        #[cfg(feature = "cef")]
         Engine::Cef => Box::new(cef::CefPage::new(url, events, window)),
         #[cfg(gate_wpe)]
         Engine::Wpe => Box::new(wpe::WpePage::new(url, events, window)),
