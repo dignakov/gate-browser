@@ -12,7 +12,7 @@ pub(crate) const MEDIA_STATE: &str = "opus.media.state";
 /// The browser asks a frame to "play" or "pause" its media.
 pub(crate) const MEDIA_CONTROL: &str = "opus.media.control";
 
-const MEDIA_SCRIPT: &str = include_str!("js/media.js");
+const MEDIA_SCRIPT: &str = include_str!("../../js/media.js");
 
 thread_local! {
     /// Each frame's media control (the watcher's returned function), by

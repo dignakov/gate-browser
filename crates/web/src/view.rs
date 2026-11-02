@@ -1,29 +1,26 @@
-//! A web page as a GPUI view.
+//! [`WebView`]: one page as a GPUI view, on whichever engine renders it. It
+//! keeps what the page reported, forwards input, and has the engine paint.
 
-use crate::client::{self, Ask, Playback, Reply, Shared};
-use crate::keys;
-use cef::{ImplBrowser as _, ImplBrowserHost as _, ImplFrame as _, *};
+use crate::engine::{self, Button, Input, Page, PageEvent};
+use crate::{Ask, Playback, Zoom};
 use gpui::{
-    App, Bounds, Context, Corners, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent,
-    StatefulInteractiveElement as _, Styled as _, Window, canvas, div, point, px, size,
+    App, Bounds, Context, Corners, CursorStyle, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement as _, Pixels, Point, Render, RenderImage, ScrollWheelEvent, StatefulInteractiveElement as _,
+    Styled as _, Window, canvas, div, point,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// What a page did, for whoever shows it.
-#[derive(Clone, Debug, PartialEq)]
+/// What a page did, for the app.
+#[derive(Clone, Debug)]
 pub enum WebEvent {
-    Created,
     /// The page took keyboard focus (a click, or focus given to it).
     Focused,
     Url(String),
     Title(String),
-    /// The page named a favicon (internal: the view fetches it).
-    FaviconUrl(Option<String>),
-    /// The favicon's pixels arrived, or it went away.
+    /// The favicon's pixels arrived, or it went away (see [`WebView::favicon`]).
     Favicon,
     Loading { loading: bool, can_go_back: bool, can_go_forward: bool },
     Progress(f64),
@@ -38,32 +35,24 @@ pub enum WebEvent {
     Playback(Playback),
     /// The page's renderer died.
     Crashed,
-    /// New pixels or cursor (internal; not emitted).
-    Repaint,
-    /// GPU frames failed; the view falls back to CPU ones (internal).
-    GpuFramesFailed,
     Closed,
 }
 
-/// A page zoom step (see [`WebView::zoom`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Zoom {
-    In,
-    Out,
-    Reset,
-}
-
 pub struct WebView {
-    shared: Rc<RefCell<Shared>>,
+    /// Its engine's page; none while asleep (see [`Self::sleeping`]).
+    page: Option<Box<dyn Page>>,
+    events: engine::Events,
     focus: FocusHandle,
-    /// Where the page was last painted, in window coordinates.
+    /// Where the page was last laid out, in window coordinates.
     bounds: Rc<Cell<Bounds<Pixels>>>,
-    /// Buttons held over the page, as CEF event flags.
-    buttons: u32,
+    /// Buttons held down on the page (a drag continues outside it).
+    buttons: u8,
     focused: bool,
     hidden: bool,
     url: String,
     title: String,
+    favicon: Option<Arc<RenderImage>>,
+    cursor: CursorStyle,
     loading: bool,
     can_go_back: bool,
     can_go_forward: bool,
@@ -77,8 +66,6 @@ pub struct WebView {
     /// Rounds the page's corners (where the pane's card is rounded).
     corners: Corners<Pixels>,
     closed: bool,
-    /// Restored but not shown yet: no browser until it is (see [`Self::sleeping`]).
-    asleep: bool,
 }
 
 impl EventEmitter<WebEvent> for WebView {}
@@ -93,95 +80,63 @@ impl WebView {
     /// A page loading `url`.
     pub fn new(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = Self::empty(url, window, cx);
-        view.create_browser();
+        view.wake(window);
         view
     }
 
-    /// A page that shows `title` (and `favicon`) but starts its browser,
+    /// A page that shows `title` (and `favicon`) but starts its engine page,
     /// loading `url`, only when first shown or navigated: restoring many
     /// spaces costs nothing until they are opened.
     pub fn sleeping(url: &str, title: &str, favicon: Option<Arc<RenderImage>>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut view = Self::empty(url, window, cx);
-        view.asleep = true;
         view.hidden = true;
         view.loading = false;
         view.title = title.to_string();
-        view.shared.borrow_mut().favicon = favicon;
+        view.favicon = favicon;
         view
     }
 
     /// Restored, and not opened since.
     pub fn is_asleep(&self) -> bool {
-        self.asleep
-    }
-
-    fn create_browser(&mut self) {
-        self.asleep = false;
-        self.loading = true;
-        let url = self.url.clone();
-        let url = url.as_str();
-        let window_info = WindowInfo {
-            windowless_rendering_enabled: 1,
-            shared_texture_enabled: self.takes_gpu_frames() as i32,
-            runtime_style: RuntimeStyle::ALLOY,
-            ..Default::default()
-        };
-        let browser_settings = BrowserSettings {
-            windowless_frame_rate: 60,
-            // Opaque white until the page paints, like other browsers.
-            background_color: 0xFFFF_FFFF,
-            ..Default::default()
-        };
-        let mut client = client::build(&self.shared);
-        let created = browser_host_create_browser(
-            Some(&window_info),
-            Some(&mut client),
-            Some(&CefString::from(url)),
-            Some(&browser_settings),
-            None,
-            None,
-        );
-        if created != 1 {
-            tracing::error!("CEF could not create a browser for {url}");
-        }
+        self.page.is_none() && !self.closed
     }
 
     fn empty(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let shared = Rc::new(RefCell::new(Shared::new()));
-        shared.borrow_mut().scale = window.scale_factor();
-        // Frames go straight into the window's atlas as they arrive.
-        shared.borrow_mut().frames = Some(crate::frames::Frames { atlas: window.atlas_handle() });
-        // As GPU buffers, when asked for and the window's GPU can import them.
-        #[cfg(target_os = "linux")]
-        if crate::gpu_frames_wanted() && !crate::gpu_frames::broken() && window.dmabuf_target().is_some() {
-            shared.borrow_mut().gpu = Some(Default::default());
-        }
-
-        let weak = cx.entity().downgrade();
-        let drain_shared = shared.clone();
-        crate::pump::add_drain(move |cx| {
-            let Some(view) = weak.upgrade() else { return false };
-            if !drain_shared.borrow().events.is_empty() {
-                view.update(cx, |view, cx| view.apply_events(cx));
+        let (events, receiver) = async_channel::unbounded();
+        // What the engine reports, in order, a batch at a time.
+        cx.spawn(async move |this, cx| {
+            while let Ok(first) = receiver.recv().await {
+                let mut batch = vec![first];
+                while let Ok(more) = receiver.try_recv() {
+                    batch.push(more);
+                }
+                if this.update(cx, |view, cx| view.apply(batch, cx)).is_err() {
+                    break;
+                }
             }
-            true
-        });
+        })
+        .detach();
 
         let focus = cx.focus_handle();
         cx.on_focus(&focus, window, |this, _, cx| {
             this.focused = true;
-            this.with_host(|h| h.set_focus(1));
+            if let Some(page) = this.page.as_mut() {
+                page.set_focus(true);
+            }
             cx.emit(WebEvent::Focused);
         })
         .detach();
         cx.on_blur(&focus, window, |this, _, _| {
             this.focused = false;
-            this.with_host(|h| h.set_focus(0));
+            if let Some(page) = this.page.as_mut() {
+                page.set_focus(false);
+            }
         })
         .detach();
 
         Self {
-            shared,
+            page: None,
+            events,
             focus,
             bounds: Rc::default(),
             buttons: 0,
@@ -189,6 +144,8 @@ impl WebView {
             hidden: false,
             url: url.to_string(),
             title: String::new(),
+            favicon: None,
+            cursor: CursorStyle::Arrow,
             loading: true,
             can_go_back: false,
             can_go_forward: false,
@@ -201,7 +158,27 @@ impl WebView {
             muted: false,
             corners: Corners::default(),
             closed: false,
-            asleep: false,
+        }
+    }
+
+    /// Starts the engine's page for `self.url`, with what the view holds.
+    fn wake(&mut self, window: &mut Window) {
+        if self.page.is_some() || self.closed {
+            return;
+        }
+        self.loading = true;
+        let mut page = engine::new_page(&self.url, self.events.clone(), window);
+        page.set_hidden(self.hidden);
+        page.set_focus(self.focused);
+        if self.muted {
+            page.set_muted(true);
+        }
+        self.page = Some(page);
+    }
+
+    fn with_page(&mut self, f: impl FnOnce(&mut dyn Page)) {
+        if let Some(page) = self.page.as_mut() {
+            f(page.as_mut());
         }
     }
 
@@ -228,7 +205,7 @@ impl WebView {
         self.ask.as_ref()
     }
     pub fn favicon(&self) -> Option<Arc<RenderImage>> {
-        self.shared.borrow().favicon.clone()
+        self.favicon.clone()
     }
     /// Whether the page is using the camera and the microphone.
     pub fn media(&self) -> (bool, bool) {
@@ -241,37 +218,8 @@ impl WebView {
     pub fn playback(&self) -> Playback {
         self.playback
     }
-
-    /// Pauses the page's playing media, or resumes what it paused.
-    pub fn play_pause(&mut self) {
-        let (command, frames) = {
-            let shared = self.shared.borrow();
-            let (command, wanted) = match shared.playback() {
-                Playback::Playing => ("pause", Playback::Playing),
-                Playback::Paused => ("play", Playback::Paused),
-                Playback::None => return,
-            };
-            let frames: Vec<String> = shared.media.iter().filter(|(_, s)| **s == wanted).map(|(f, _)| f.clone()).collect();
-            (command, frames)
-        };
-        self.with_browser(|browser| {
-            for id in &frames {
-                let Some(frame) = browser.frame_by_identifier(Some(&CefString::from(id.as_str()))) else { continue };
-                let Some(mut message) = process_message_create(Some(&CefString::from(crate::renderer::MEDIA_CONTROL))) else { continue };
-                if let Some(args) = message.argument_list() {
-                    args.set_string(0, Some(&CefString::from(command)));
-                }
-                frame.send_process_message(ProcessId::RENDERER, Some(&mut message));
-            }
-        });
-    }
     pub fn muted(&self) -> bool {
         self.muted
-    }
-    pub fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
-        self.muted = muted;
-        self.with_host(|h| h.set_audio_muted(muted as i32));
-        cx.notify();
     }
     /// The unread count a page shows in its title, as "(3) Inbox" does.
     pub fn unread(&self) -> Option<u32> {
@@ -280,6 +228,15 @@ impl WebView {
         count.trim_end_matches('+').parse().ok().filter(|n| *n > 0)
     }
 
+    /// Pauses the page's playing media, or resumes what it paused.
+    pub fn play_pause(&mut self) {
+        self.with_page(|p| p.play_pause());
+    }
+    pub fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
+        self.muted = muted;
+        self.with_page(|p| p.set_muted(muted));
+        cx.notify();
+    }
     pub fn set_corners(&mut self, corners: Corners<Pixels>) {
         self.corners = corners;
     }
@@ -287,257 +244,131 @@ impl WebView {
     /// Answers the page's question: OK/Allow or Cancel/Deny, with the text
     /// typed for a prompt.
     pub fn answer(&mut self, accept: bool, input: Option<&str>, cx: &mut Context<Self>) {
-        let pending = self.shared.borrow_mut().ask.take();
         self.ask = None;
+        self.with_page(|p| p.answer(accept, input));
         cx.emit(WebEvent::Ask);
         cx.notify();
-        let Some((_, reply)) = pending else { return };
-        match reply {
-            Reply::Dialog(callback) => callback.cont(accept as i32, input.map(CefString::from).as_ref()),
-            Reply::Media(callback, requested) => {
-                if accept {
-                    callback.cont(requested)
-                } else {
-                    callback.cancel()
-                }
-            }
-            Reply::Prompt(callback, _) => callback.cont(if accept {
-                PermissionRequestResult::ACCEPT
-            } else {
-                PermissionRequestResult::DENY
-            }),
-        }
     }
 
+    /// Goes to `url`, starting the engine's page if it sleeps.
     pub fn load(&mut self, url: &str) {
         self.url = url.to_string();
-        if self.asleep {
-            return self.create_browser();
-        }
-        self.with_browser(|b| {
-            if let Some(frame) = b.main_frame() {
-                frame.load_url(Some(&CefString::from(url)));
-            }
-        });
+        // A sleeping page wakes (on the next paint) at its new address.
+        self.with_page(|p| p.load(url));
     }
     pub fn back(&mut self) {
-        self.with_browser(|b| b.go_back());
+        self.with_page(|p| p.back());
     }
     pub fn forward(&mut self) {
-        self.with_browser(|b| b.go_forward());
+        self.with_page(|p| p.forward());
     }
     pub fn reload(&mut self) {
-        self.with_browser(|b| b.reload());
+        self.with_page(|p| p.reload());
     }
     pub fn stop(&mut self) {
-        self.with_browser(|b| b.stop_load());
+        self.with_page(|p| p.stop());
     }
-    /// Zooms the page as Chromium does: its steps (25% to 500%), and
-    /// remembered for the site.
+    /// Zooms the page as its engine does, remembered for the site.
     pub fn zoom(&mut self, zoom: Zoom) {
-        let command = match zoom {
-            Zoom::In => ZoomCommand::IN,
-            Zoom::Out => ZoomCommand::OUT,
-            Zoom::Reset => ZoomCommand::RESET,
-        };
-        self.with_host(|h| h.zoom(command));
+        self.with_page(|p| p.zoom(zoom));
     }
-
     /// The page's zoom in percent (100: none).
     pub fn zoom_percent(&self) -> u32 {
-        let mut level = 0.0;
-        self.with_host(|h| level = h.zoom_level());
-        // Chromium's zoom levels are powers of 1.2.
-        (1.2f64.powf(level) * 100.0).round() as u32
+        self.page.as_ref().map_or(100, |p| p.zoom_percent())
     }
-
     pub fn show_dev_tools(&mut self) {
-        // DevTools open in their own native window for now.
-        self.with_host(|h| {
-            let info = WindowInfo { runtime_style: RuntimeStyle::ALLOY, ..Default::default() };
-            h.show_dev_tools(Some(&info), None, None, None);
-        });
+        self.with_page(|p| p.show_dev_tools());
     }
 
     /// A page that is not shown stops rendering (and its timers slow down).
+    /// A sleeping page wakes when first shown (on its next paint).
     pub fn set_hidden(&mut self, hidden: bool) {
-        if self.asleep && !hidden {
-            self.hidden = false;
-            return self.create_browser();
-        }
         if self.hidden != hidden {
             self.hidden = hidden;
-            self.with_host(|h| h.was_hidden(hidden as i32));
+            self.with_page(|p| p.set_hidden(hidden));
         }
     }
 
     /// Closes the page. The view stops painting; drop it after.
     pub fn close(&mut self) {
         self.closed = true;
-        self.with_host(|h| h.close_browser(1));
+        self.with_page(|p| p.close());
     }
 
-    /// Whether this view's browser hands frames over as GPU buffers.
-    fn takes_gpu_frames(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        return self.shared.borrow().gpu.is_some();
-        #[cfg(not(target_os = "linux"))]
-        false
-    }
-
-    /// GPU frames failed: a browser takes one kind of frame for its life, so
-    /// a new one (loading the same page) takes CPU frames.
-    fn fall_back_to_cpu_frames(&mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            let mut shared = self.shared.borrow_mut();
-            let shared = &mut *shared;
-            if shared.gpu.take().is_none() {
-                return;
-            }
-            if let Some(frames) = &shared.frames {
-                frames.release(&mut shared.page);
-                frames.release(&mut shared.popup);
-            }
-        }
-        if self.asleep || self.closed {
-            return;
-        }
-        self.with_host(|h| h.close_browser(1));
-        self.create_browser();
-    }
-
-    /// Runs `f` with the browser, without holding a borrow of the shared
-    /// state (CEF may call back into it).
-    fn with_browser(&self, f: impl FnOnce(&Browser)) {
-        let browser = self.shared.borrow().browser.clone();
-        if let Some(browser) = browser {
-            f(&browser);
-        }
-    }
-
-    fn with_host(&self, f: impl FnOnce(&BrowserHost)) {
-        self.with_browser(|b| {
-            if let Some(host) = b.host() {
-                f(&host);
-            }
-        });
-    }
-
-    fn apply_events(&mut self, cx: &mut Context<Self>) {
-        let events = std::mem::take(&mut self.shared.borrow_mut().events);
-        let mut repaint = false;
-        for event in events {
-            match &event {
-                WebEvent::Repaint => {
-                    repaint = true;
-                    continue;
+    fn apply(&mut self, batch: Vec<PageEvent>, cx: &mut Context<Self>) {
+        for event in batch {
+            let out = match event {
+                PageEvent::Repaint => None,
+                PageEvent::Pump => {
+                    self.with_page(|p| p.pump());
+                    None
                 }
-                WebEvent::GpuFramesFailed => {
-                    self.fall_back_to_cpu_frames();
-                    continue;
+                PageEvent::Cursor(cursor) => {
+                    self.cursor = cursor;
+                    None
                 }
-                WebEvent::Created => {
-                    // Sizes may have changed before the browser existed.
-                    self.with_host(|h| {
-                        h.notify_screen_info_changed();
-                        h.was_resized();
-                    });
-                    if self.focused {
-                        self.with_host(|h| h.set_focus(1));
-                    }
-                    if self.hidden {
-                        self.with_host(|h| h.was_hidden(1));
-                    }
+                PageEvent::Url(url) => {
+                    self.url = url.clone();
+                    Some(WebEvent::Url(url))
                 }
-                WebEvent::Url(url) => self.url = url.clone(),
-                WebEvent::FaviconUrl(url) => {
-                    self.fetch_favicon(url.clone());
-                    continue;
+                PageEvent::Title(title) => {
+                    self.title = title.clone();
+                    Some(WebEvent::Title(title))
                 }
-                WebEvent::Ask => self.ask = self.shared.borrow().ask.as_ref().map(|(ask, _)| ask.clone()),
-                WebEvent::Media { camera, microphone } => {
-                    self.camera = *camera;
-                    self.microphone = *microphone;
+                PageEvent::Favicon(favicon) => {
+                    self.favicon = favicon;
+                    Some(WebEvent::Favicon)
                 }
-                WebEvent::Crashed => self.crashed = true,
-                WebEvent::Playback(playback) => self.playback = *playback,
-                WebEvent::Title(title) => self.title = title.clone(),
-                WebEvent::Loading { loading, can_go_back, can_go_forward } => {
-                    self.loading = *loading;
-                    if *loading {
+                PageEvent::Loading { loading, can_go_back, can_go_forward } => {
+                    self.loading = loading;
+                    if loading {
                         self.crashed = false;
                     }
-                    self.can_go_back = *can_go_back;
-                    self.can_go_forward = *can_go_forward;
+                    self.can_go_back = can_go_back;
+                    self.can_go_forward = can_go_forward;
+                    Some(WebEvent::Loading { loading, can_go_back, can_go_forward })
                 }
-                WebEvent::Progress(p) => self.progress = *p,
-                _ => {}
+                PageEvent::Progress(p) => {
+                    self.progress = p;
+                    Some(WebEvent::Progress(p))
+                }
+                PageEvent::Fullscreen(f) => Some(WebEvent::Fullscreen(f)),
+                PageEvent::OpenTab { url, background } => Some(WebEvent::OpenTab { url, background }),
+                PageEvent::Ask(ask) => {
+                    self.ask = ask;
+                    Some(WebEvent::Ask)
+                }
+                PageEvent::Media { camera, microphone } => {
+                    self.camera = camera;
+                    self.microphone = microphone;
+                    Some(WebEvent::Media { camera, microphone })
+                }
+                PageEvent::Playback(playback) => {
+                    self.playback = playback;
+                    Some(WebEvent::Playback(playback))
+                }
+                PageEvent::Crashed => {
+                    self.crashed = true;
+                    Some(WebEvent::Crashed)
+                }
+                PageEvent::Closed => Some(WebEvent::Closed),
+            };
+            if let Some(event) = out {
+                cx.emit(event);
             }
-            cx.emit(event);
-            repaint = true;
         }
-        if repaint {
-            cx.notify();
-        }
+        cx.notify();
     }
 
-    /// Fetches the page's favicon; [`WebEvent::Favicon`] follows when the
-    /// pixels arrive. Sized for the sidebar's tiles at the display's scale.
-    fn fetch_favicon(&mut self, url: Option<String>) {
-        let (scale, unchanged) = {
-            let shared = self.shared.borrow();
-            (shared.scale, shared.favicon_url == url)
-        };
-        if unchanged {
-            return;
-        }
-        {
-            let mut shared = self.shared.borrow_mut();
-            shared.favicon_url = url.clone();
-            if url.is_none() {
-                shared.favicon = None;
-                shared.push(WebEvent::Favicon);
-            }
-        }
-        let Some(url) = url else { return };
-        let mut callback = client::favicon_callback(&self.shared, scale);
-        let size = (32.0 * scale).ceil() as u32;
-        self.with_host(|h| h.download_image(Some(&CefString::from(url.as_str())), 1, size, 0, Some(&mut callback)));
-    }
-
-    /// Tells CEF the page's new size or scale, when they changed.
-    fn layout(&self, bounds: Bounds<Pixels>, scale: f32) {
-        self.bounds.set(bounds);
-        let want = (f32::from(bounds.size.width).round() as i32, f32::from(bounds.size.height).round() as i32);
-        let changed = {
-            let mut shared = self.shared.borrow_mut();
-            let size_changed = shared.view_size != want;
-            let scale_changed = shared.scale != scale;
-            shared.view_size = want;
-            shared.scale = scale;
-            (size_changed, scale_changed)
-        };
-        if changed.1 {
-            self.with_host(|h| h.notify_screen_info_changed());
-        }
-        if changed.0 || changed.1 {
-            self.with_host(|h| h.was_resized());
-        }
-    }
-
-    fn mouse_event(&self, position: Point<Pixels>, modifiers: &gpui::Modifiers) -> MouseEvent {
+    /// A position in the page's coordinates.
+    fn at(&self, position: Point<Pixels>) -> Point<f32> {
         let origin = self.bounds.get().origin;
-        MouseEvent {
-            x: f32::from(position.x - origin.x).round() as i32,
-            y: f32::from(position.y - origin.y).round() as i32,
-            modifiers: keys::modifiers(modifiers) | self.buttons,
-        }
+        point(f32::from(position.x - origin.x), f32::from(position.y - origin.y))
     }
 
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
-        let Some((button, flag)) = button(ev.button) else {
+        let Some(button) = button(ev.button) else {
             // Back/forward mouse buttons navigate.
             if let MouseButton::Navigate(dir) = ev.button {
                 match dir {
@@ -547,145 +378,79 @@ impl WebView {
             }
             return;
         };
-        self.buttons |= flag;
-        let event = self.mouse_event(ev.position, &ev.modifiers);
-        let clicks = ev.click_count.clamp(1, 3) as i32;
-        self.with_host(|h| h.send_mouse_click_event(Some(&event), button, 0, clicks));
+        self.buttons += 1;
+        let at = self.at(ev.position);
+        self.with_page(|p| p.input(Input::MouseDown { at, button, clicks: ev.click_count, modifiers: ev.modifiers }));
         cx.stop_propagation();
     }
 
     fn mouse_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        let Some((button, flag)) = button(ev.button) else { return };
-        if self.buttons & flag == 0 {
+        let Some(button) = button(ev.button) else { return };
+        if self.buttons == 0 {
             return;
         }
-        let event = self.mouse_event(ev.position, &ev.modifiers);
-        self.buttons &= !flag;
-        let clicks = ev.click_count.clamp(1, 3) as i32;
-        self.with_host(|h| h.send_mouse_click_event(Some(&event), button, 1, clicks));
+        self.buttons -= 1;
+        let at = self.at(ev.position);
+        self.with_page(|p| p.input(Input::MouseUp { at, button, clicks: ev.click_count, modifiers: ev.modifiers }));
     }
 
-    fn mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, _cx: &mut Context<Self>) {
-        let inside = self.bounds.get().contains(&ev.position);
+    fn mouse_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {
         // Outside the page only a drag that started on it continues.
-        if !inside && self.buttons == 0 {
+        if !self.bounds.get().contains(&ev.position) && self.buttons == 0 {
             return;
         }
-        let _ = window;
-        let event = self.mouse_event(ev.position, &ev.modifiers);
-        self.with_host(|h| h.send_mouse_move_event(Some(&event), 0));
+        let at = self.at(ev.position);
+        self.with_page(|p| p.input(Input::MouseMove { at, modifiers: ev.modifiers }));
     }
 
     fn mouse_leave(&mut self) {
-        if self.buttons != 0 {
-            return;
+        if self.buttons == 0 {
+            self.with_page(|p| p.input(Input::MouseLeave));
         }
-        let event = MouseEvent { x: -1, y: -1, modifiers: 0 };
-        self.with_host(|h| h.send_mouse_move_event(Some(&event), 1));
     }
 
     fn scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // Chromium scrolls 40px per wheel line on Linux.
-        let delta = match ev.delta {
-            ScrollDelta::Pixels(p) => point(f32::from(p.x), f32::from(p.y)),
-            ScrollDelta::Lines(l) => point(l.x * 40.0, l.y * 40.0),
-        };
-        let event = self.mouse_event(ev.position, &ev.modifiers);
-        self.with_host(|h| h.send_mouse_wheel_event(Some(&event), delta.x.round() as i32, delta.y.round() as i32));
+        let at = self.at(ev.position);
+        self.with_page(|p| p.input(Input::Scroll { at, delta: ev.delta, modifiers: ev.modifiers }));
         cx.stop_propagation();
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let k = &ev.keystroke;
-        let mut flags = keys::modifiers(&k.modifiers);
-        if ev.is_held {
-            flags |= keys::IS_REPEAT;
-        }
-        let code = keys::windows_key_code(k);
-        let mut event = KeyEvent {
-            type_: KeyEventType::RAWKEYDOWN,
-            modifiers: flags,
-            windows_key_code: code,
-            ..Default::default()
-        };
-        self.with_host(|h| h.send_key_event(Some(&event)));
-        if let Some(ch) = keys::typed_char(k) {
-            event.type_ = KeyEventType::CHAR;
-            event.windows_key_code = ch as i32;
-            event.character = ch;
-            event.unmodified_character = ch;
-            self.with_host(|h| h.send_key_event(Some(&event)));
-        }
+        self.with_page(|p| p.input(Input::KeyDown { keystroke: &ev.keystroke, repeat: ev.is_held }));
         cx.stop_propagation();
     }
 
     fn key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let k = &ev.keystroke;
-        let event = KeyEvent {
-            type_: KeyEventType::KEYUP,
-            modifiers: keys::modifiers(&k.modifiers),
-            windows_key_code: keys::windows_key_code(k),
-            ..Default::default()
-        };
-        self.with_host(|h| h.send_key_event(Some(&event)));
+        self.with_page(|p| p.input(Input::KeyUp { keystroke: &ev.keystroke }));
         cx.stop_propagation();
     }
 }
 
-fn button(b: MouseButton) -> Option<(MouseButtonType, u32)> {
+fn button(b: MouseButton) -> Option<Button> {
     match b {
-        MouseButton::Left => Some((MouseButtonType::LEFT, keys::LEFT_BUTTON)),
-        MouseButton::Middle => Some((MouseButtonType::MIDDLE, keys::MIDDLE_BUTTON)),
-        MouseButton::Right => Some((MouseButtonType::RIGHT, keys::RIGHT_BUTTON)),
+        MouseButton::Left => Some(Button::Left),
+        MouseButton::Middle => Some(Button::Middle),
+        MouseButton::Right => Some(Button::Right),
         MouseButton::Navigate(_) => None,
     }
 }
 
 impl Drop for WebView {
     fn drop(&mut self) {
-        if !self.closed {
-            self.with_host(|h| h.close_browser(1));
-        }
+        self.close();
     }
-}
-
-/// Paints a surface's atlas tile at `origin`; false when the atlas lost the
-/// tile (its content is gone until a whole new frame arrives).
-fn paint_tile(
-    image: &Arc<RenderImage>,
-    origin: Point<Pixels>,
-    clip: Bounds<Pixels>,
-    corners: Corners<Pixels>,
-    scale: f32,
-    window: &mut Window,
-) -> bool {
-    match window.insert_blank_image(image, 0) {
-        Ok(false) => {}
-        Ok(true) => return false,
-        Err(error) => {
-            tracing::warn!("web frame tile: {error:#}");
-            return false;
-        }
-    }
-    let pixels = image.size(0);
-    let shown = size(px(pixels.width.0 as f32 / scale), px(pixels.height.0 as f32 / scale));
-    window.with_content_mask(Some(gpui::ContentMask { bounds: clip }), |window| {
-        let _ = window.paint_image(Bounds::new(origin, shown), corners, image.clone(), 0, false);
-    });
-    true
 }
 
 impl Render for WebView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity();
-        let shared = self.shared.clone();
-        let cursor = shared.borrow().cursor;
-        let corners = self.corners;
+        let layout_view = cx.entity();
+        let paint_view = cx.entity();
+        let bounds_cell = self.bounds.clone();
         div()
             .id("web-view")
             .size_full()
             .track_focus(&self.focus)
-            .cursor(cursor)
+            .cursor(self.cursor)
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
@@ -709,25 +474,21 @@ impl Render for WebView {
             .child(
                 canvas(
                     move |bounds, window, cx| {
-                        entity.read(cx).layout(bounds, window.scale_factor());
-                    },
-                    move |bounds, _, window, _cx| {
+                        bounds_cell.set(bounds);
                         let scale = window.scale_factor();
-                        let shared = shared.borrow();
-                        let mut lost = false;
-                        if let Some(image) = &shared.page.image {
-                            lost |= !paint_tile(image, bounds.origin, bounds, corners, scale, window);
-                        }
-                        let popup_origin = shared.popup_rect.as_ref().map(|r| bounds.origin + point(px(r.x as f32), px(r.y as f32)));
-                        if let (Some(image), Some(origin)) = (&shared.popup.image, popup_origin) {
-                            lost |= !paint_tile(image, origin, bounds, Corners::default(), scale, window);
-                        }
-                        let browser = shared.browser.clone();
-                        drop(shared);
-                        // A tile the atlas dropped needs a whole new frame.
-                        if lost && let Some(host) = browser.as_ref().and_then(|b| b.host()) {
-                            host.invalidate(PaintElementType::VIEW);
-                        }
+                        layout_view.update(cx, |view, _| {
+                            // A sleeping page wakes when it is first shown.
+                            if !view.hidden {
+                                view.wake(window);
+                            }
+                            view.with_page(|p| p.layout(bounds, scale));
+                        });
+                    },
+                    move |bounds, _, window, cx| {
+                        paint_view.update(cx, |view, _| {
+                            let corners = view.corners;
+                            view.with_page(|p| p.paint(bounds, corners, window));
+                        });
                     },
                 )
                 .size_full(),

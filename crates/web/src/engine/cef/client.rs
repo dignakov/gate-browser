@@ -1,11 +1,12 @@
-//! CEF's side of a web view: the client and its handlers. They run on the
-//! main thread inside CEF calls, so they only record what happened in
-//! [`Shared`] and wake the pump; the view applies it with GPUI's context.
+//! CEF's side of a page: the client and its handlers. They run on the main
+//! thread inside CEF calls; they keep CEF's state in [`Shared`] and report
+//! what the page does as [`PageEvent`]s.
 //!
 //! Never hold a borrow of [`Shared`] while calling into CEF: CEF may call
 //! back synchronously (e.g. `was_resized` asks `view_rect`).
 
-use crate::view::WebEvent;
+use crate::engine::{Events, PageEvent};
+use crate::{Ask, Playback};
 use cef::{rc::Rc as _, *};
 use gpui::{CursorStyle, RenderImage};
 use std::cell::RefCell;
@@ -13,35 +14,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Something the page waits on the user for: a JavaScript dialog or a
-/// permission request. The page stays usable; the question waits in its pane.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Ask {
-    Alert { message: String },
-    Confirm { message: String },
-    Prompt { message: String, default: String },
-    /// "Leave site?" before navigating away or reloading.
-    Leave { reload: bool },
-    Permission { origin: String, what: Vec<&'static str> },
-}
-
-/// What a page's media is doing. Media counts once it played audibly.
-/// Ordered by precedence: a page with any media playing is playing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Playback {
-    #[default]
-    None,
-    Paused,
-    Playing,
-}
-
-impl Playback {
-    fn parse(state: &str) -> Self {
-        match state {
-            "playing" => Playback::Playing,
-            "paused" => Playback::Paused,
-            _ => Playback::None,
-        }
+fn parse_playback(state: &str) -> Playback {
+    match state {
+        "playing" => Playback::Playing,
+        "paused" => Playback::Paused,
+        _ => Playback::None,
     }
 }
 
@@ -62,44 +39,53 @@ pub(crate) struct Shared {
     /// last laid it out. CEF reads them through `view_rect`/`screen_info`.
     pub view_size: (i32, i32),
     pub scale: f32,
+    /// What the view last asked for, applied once the browser exists.
+    pub hidden: bool,
+    pub focused: bool,
+    /// The page's address, as last reported (a replacement browser loads it).
+    pub url: String,
     /// The window's atlas, which frames go into as they arrive.
-    pub frames: Option<crate::frames::Frames>,
-    pub page: crate::frames::Surface,
-    pub popup: crate::frames::Surface,
-    /// GPU frames (Linux): set while this view takes them.
+    pub frames: Option<super::frames::Frames>,
+    pub page: super::frames::Surface,
+    pub popup: super::frames::Surface,
+    /// GPU frames (Linux): set while this page takes them.
     #[cfg(target_os = "linux")]
-    pub gpu: Option<crate::gpu_frames::GpuFrames>,
+    pub gpu: Option<super::gpu_frames::GpuFrames>,
+    /// GPU frames failed: the page falls back to CPU frames (in `pump`).
+    pub gpu_failed: bool,
     /// Where the popup sits, in logical view pixels, while shown.
     pub popup_rect: Option<Rect>,
     pub cursor: CursorStyle,
     /// The question the page is waiting on, if any (one at a time).
     pub ask: Option<(Ask, Reply)>,
-    /// The favicon asked for last, and its pixels once they arrived.
+    /// The favicon asked for last.
     pub favicon_url: Option<String>,
-    pub favicon: Option<Arc<RenderImage>>,
     /// Frames with media, by frame identifier, and what it's doing.
     pub media: HashMap<String, Playback>,
-    pub events: Vec<WebEvent>,
+    pub events: Events,
 }
 
 impl Shared {
-    pub fn new() -> Self {
+    pub fn new(url: &str, events: Events) -> Self {
         Self {
             browser: None,
             view_size: (800, 600),
             scale: 1.0,
+            hidden: false,
+            focused: false,
+            url: url.to_string(),
             frames: None,
             page: Default::default(),
             popup: Default::default(),
             #[cfg(target_os = "linux")]
             gpu: None,
+            gpu_failed: false,
             popup_rect: None,
             cursor: CursorStyle::Arrow,
             ask: None,
             favicon_url: None,
-            favicon: None,
             media: HashMap::new(),
-            events: Vec::new(),
+            events,
         }
     }
 
@@ -119,13 +105,13 @@ impl Shared {
         }
         let now = self.playback();
         if now != before {
-            self.push(WebEvent::Playback(now));
+            self.push(PageEvent::Playback(now));
         }
     }
 
-    pub(crate) fn push(&mut self, event: WebEvent) {
-        self.events.push(event);
-        crate::pump::wake();
+    pub(crate) fn push(&self, event: PageEvent) {
+        // The view is gone if nobody listens: nothing to tell.
+        let _ = self.events.try_send(event);
     }
 }
 
@@ -187,14 +173,14 @@ wrap_render_handler! {
                     frames.release(&mut shared.popup);
                 }
             }
-            shared.push(WebEvent::Repaint);
+            shared.push(PageEvent::Repaint);
         }
 
         fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
             if let Some(rect) = rect {
                 let mut shared = self.shared.borrow_mut();
                 shared.popup_rect = Some(rect.clone());
-                shared.push(WebEvent::Repaint);
+                shared.push(PageEvent::Repaint);
             }
         }
 
@@ -213,8 +199,12 @@ wrap_render_handler! {
                 let shared = &mut *shared;
                 let (Some(gpu), Some(frames), Some(info)) = (shared.gpu.as_mut(), shared.frames.as_ref(), info) else { return };
                 let surface = if type_ == PaintElementType::POPUP { &mut shared.popup } else { &mut shared.page };
-                let event = if gpu.take(frames, surface, info, dirty_rects.unwrap_or(&[])) { WebEvent::Repaint } else { WebEvent::GpuFramesFailed };
-                shared.push(event);
+                if gpu.take(frames, surface, info, dirty_rects.unwrap_or(&[])) {
+                    shared.push(PageEvent::Repaint);
+                } else {
+                    shared.gpu_failed = true;
+                    shared.push(PageEvent::Pump);
+                }
             }
             #[cfg(not(target_os = "linux"))]
             let _ = (type_, dirty_rects, info);
@@ -237,7 +227,7 @@ wrap_render_handler! {
             if let Err(error) = frames.take_pixels(surface, dirty_rects.unwrap_or(&[]), buffer, width, height) {
                 tracing::warn!("web frame upload: {error:#}");
             }
-            shared.push(WebEvent::Repaint);
+            shared.push(PageEvent::Repaint);
         }
     }
 }
@@ -250,21 +240,25 @@ wrap_display_handler! {
     impl DisplayHandler {
         fn on_address_change(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, url: Option<&CefString>) {
             if frame.is_some_and(|f| f.is_main() == 1) {
-                self.shared.borrow_mut().push(WebEvent::Url(text(url)));
+                let mut shared = self.shared.borrow_mut();
+                shared.url = text(url);
+                shared.push(PageEvent::Url(shared.url.clone()));
             }
         }
 
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
-            self.shared.borrow_mut().push(WebEvent::Title(text(title)));
+            self.shared.borrow().push(PageEvent::Title(text(title)));
         }
 
-        fn on_favicon_urlchange(&self, _browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
+        fn on_favicon_urlchange(&self, browser: Option<&mut Browser>, icon_urls: Option<&mut CefStringList>) {
             let first = icon_urls.and_then(|list| strings(list).into_iter().next());
-            self.shared.borrow_mut().push(WebEvent::FaviconUrl(first));
+            if let Some(browser) = browser {
+                fetch_favicon(&self.shared, browser, first);
+            }
         }
 
         fn on_loading_progress_change(&self, _browser: Option<&mut Browser>, progress: f64) {
-            self.shared.borrow_mut().push(WebEvent::Progress(progress));
+            self.shared.borrow().push(PageEvent::Progress(progress));
         }
 
         fn on_media_access_change(
@@ -274,11 +268,11 @@ wrap_display_handler! {
             has_audio_access: ::std::os::raw::c_int,
         ) {
             let (camera, microphone) = (has_video_access == 1, has_audio_access == 1);
-            self.shared.borrow_mut().push(WebEvent::Media { camera, microphone });
+            self.shared.borrow().push(PageEvent::Media { camera, microphone });
         }
 
         fn on_fullscreen_mode_change(&self, _browser: Option<&mut Browser>, fullscreen: ::std::os::raw::c_int) {
-            self.shared.borrow_mut().push(WebEvent::Fullscreen(fullscreen == 1));
+            self.shared.borrow().push(PageEvent::Fullscreen(fullscreen == 1));
         }
 
         fn on_cursor_change(
@@ -289,10 +283,10 @@ wrap_display_handler! {
             _custom_cursor_info: Option<&CursorInfo>,
         ) -> ::std::os::raw::c_int {
             let mut shared = self.shared.borrow_mut();
-            let cursor = crate::keys::cursor(type_);
+            let cursor = super::keys::cursor(type_);
             if shared.cursor != cursor {
                 shared.cursor = cursor;
-                shared.push(WebEvent::Repaint);
+                shared.push(PageEvent::Cursor(cursor));
             }
             1
         }
@@ -307,10 +301,10 @@ wrap_load_handler! {
     impl LoadHandler {
         // A new document: until it names favicons, assume the site's
         // default one, as browsers do (CEF only reports declared icons).
-        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
-            let Some(frame) = frame.filter(|f| f.is_main() == 1) else { return };
+        fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+            let (Some(browser), Some(frame)) = (browser, frame.filter(|f| f.is_main() == 1)) else { return };
             let url = CefString::from(&frame.url()).to_string();
-            self.shared.borrow_mut().push(WebEvent::FaviconUrl(default_favicon(&url)));
+            fetch_favicon(&self.shared, browser, default_favicon(&url));
         }
 
         fn on_loading_state_change(
@@ -320,7 +314,7 @@ wrap_load_handler! {
             can_go_back: ::std::os::raw::c_int,
             can_go_forward: ::std::os::raw::c_int,
         ) {
-            self.shared.borrow_mut().push(WebEvent::Loading {
+            self.shared.borrow().push(PageEvent::Loading {
                 loading: is_loading == 1,
                 can_go_back: can_go_back == 1,
                 can_go_forward: can_go_forward == 1,
@@ -353,14 +347,26 @@ wrap_life_span_handler! {
         ) -> ::std::os::raw::c_int {
             // We own tabs: every new window becomes one of our tabs.
             let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
-            self.shared.borrow_mut().push(WebEvent::OpenTab { url: text(target_url), background });
+            self.shared.borrow().push(PageEvent::OpenTab { url: text(target_url), background });
             1
         }
 
         fn on_after_created(&self, browser: Option<&mut Browser>) {
-            let mut shared = self.shared.borrow_mut();
-            shared.browser = browser.cloned();
-            shared.push(WebEvent::Created);
+            let (hidden, focused) = {
+                let mut shared = self.shared.borrow_mut();
+                shared.browser = browser.as_deref().cloned();
+                (shared.hidden, shared.focused)
+            };
+            // What the view asked for before the browser existed.
+            let Some(host) = browser.and_then(|b| b.host()) else { return };
+            host.notify_screen_info_changed();
+            host.was_resized();
+            if focused {
+                host.set_focus(1);
+            }
+            if hidden {
+                host.was_hidden(1);
+            }
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {
@@ -372,7 +378,7 @@ wrap_life_span_handler! {
                 return;
             }
             shared.browser = None;
-            shared.push(WebEvent::Closed);
+            shared.push(PageEvent::Closed);
         }
     }
 }
@@ -408,8 +414,8 @@ wrap_jsdialog_handler! {
                 JsdialogType::PROMPT => Ask::Prompt { message, default: text(default_prompt_text) },
                 _ => Ask::Alert { message },
             };
+            shared.push(PageEvent::Ask(Some(ask.clone())));
             shared.ask = Some((ask, Reply::Dialog(callback.clone())));
-            shared.push(WebEvent::Ask);
             1
         }
 
@@ -422,8 +428,9 @@ wrap_jsdialog_handler! {
         ) -> ::std::os::raw::c_int {
             let mut shared = self.shared.borrow_mut();
             let Some(callback) = callback.filter(|_| shared.ask.is_none()) else { return 0 };
-            shared.ask = Some((Ask::Leave { reload: is_reload == 1 }, Reply::Dialog(callback.clone())));
-            shared.push(WebEvent::Ask);
+            let ask = Ask::Leave { reload: is_reload == 1 };
+            shared.push(PageEvent::Ask(Some(ask.clone())));
+            shared.ask = Some((ask, Reply::Dialog(callback.clone())));
             1
         }
 
@@ -432,7 +439,7 @@ wrap_jsdialog_handler! {
             let mut shared = self.shared.borrow_mut();
             if matches!(shared.ask, Some((_, Reply::Dialog(_)))) {
                 shared.ask = None;
-                shared.push(WebEvent::Ask);
+                shared.push(PageEvent::Ask(None));
             }
         }
     }
@@ -456,8 +463,8 @@ wrap_permission_handler! {
             // Busy or no way to answer: CEF's default, which denies.
             let Some(callback) = callback.filter(|_| shared.ask.is_none()) else { return 0 };
             let ask = Ask::Permission { origin: text(requesting_origin), what: media_names(requested_permissions) };
+            shared.push(PageEvent::Ask(Some(ask.clone())));
             shared.ask = Some((ask, Reply::Media(callback.clone(), requested_permissions)));
-            shared.push(WebEvent::Ask);
             1
         }
 
@@ -472,8 +479,8 @@ wrap_permission_handler! {
             let mut shared = self.shared.borrow_mut();
             let Some(callback) = callback.filter(|_| shared.ask.is_none()) else { return 0 };
             let ask = Ask::Permission { origin: text(requesting_origin), what: permission_names(requested_permissions) };
+            shared.push(PageEvent::Ask(Some(ask.clone())));
             shared.ask = Some((ask, Reply::Prompt(callback.clone(), prompt_id)));
-            shared.push(WebEvent::Ask);
             1
         }
 
@@ -486,7 +493,7 @@ wrap_permission_handler! {
             let mut shared = self.shared.borrow_mut();
             if matches!(shared.ask, Some((_, Reply::Prompt(_, id))) if id == prompt_id) {
                 shared.ask = None;
-                shared.push(WebEvent::Ask);
+                shared.push(PageEvent::Ask(None));
             }
         }
     }
@@ -563,11 +570,11 @@ wrap_request_handler! {
             _error_string: Option<&CefString>,
         ) {
             let mut shared = self.shared.borrow_mut();
-            shared.push(WebEvent::Crashed);
+            shared.push(PageEvent::Crashed);
             // Its frames went with it.
             if !shared.media.is_empty() {
                 shared.media.clear();
-                shared.push(WebEvent::Playback(Playback::None));
+                shared.push(PageEvent::Playback(Playback::None));
             }
         }
     }
@@ -588,13 +595,12 @@ wrap_download_image_callback! {
         ) {
             // Read the pixels before borrowing: it calls into CEF.
             let picture = image.and_then(|image| bitmap(image, self.scale));
-            let mut shared = self.shared.borrow_mut();
+            let shared = self.shared.borrow();
             // A newer favicon was asked for meanwhile.
             if shared.favicon_url.as_deref() != Some(text(image_url).as_str()) {
                 return;
             }
-            shared.favicon = picture;
-            shared.push(WebEvent::Favicon);
+            shared.push(PageEvent::Favicon(picture));
         }
     }
 }
@@ -609,8 +615,27 @@ fn bitmap(image: &Image, scale: f32) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new([image::Frame::new(buffer)])))
 }
 
-pub(crate) fn favicon_callback(shared: &SharedRef, scale: f32) -> DownloadImageCallback {
-    FaviconLoaded::new(shared.clone(), scale)
+/// Fetches the page's favicon (`None`: it has none); a
+/// [`PageEvent::Favicon`] follows when the pixels arrive, sized for the
+/// sidebar's tiles at the display's scale.
+fn fetch_favicon(shared: &SharedRef, browser: &Browser, url: Option<String>) {
+    let scale = {
+        let mut state = shared.borrow_mut();
+        if state.favicon_url == url {
+            return;
+        }
+        state.favicon_url = url.clone();
+        state.scale
+    };
+    let Some(url) = url else {
+        shared.borrow().push(PageEvent::Favicon(None));
+        return;
+    };
+    let mut callback = FaviconLoaded::new(shared.clone(), scale);
+    let size = (32.0 * scale).ceil() as u32;
+    if let Some(host) = browser.host() {
+        host.download_image(Some(&CefString::from(url.as_str())), 1, size, 0, Some(&mut callback));
+    }
 }
 
 wrap_frame_handler! {
@@ -676,12 +701,12 @@ wrap_client! {
             message: Option<&mut ProcessMessage>,
         ) -> ::std::os::raw::c_int {
             let (Some(frame), Some(message)) = (frame, message) else { return 0 };
-            if CefString::from(&message.name()).to_string() != crate::renderer::MEDIA_STATE {
+            if CefString::from(&message.name()).to_string() != super::renderer::MEDIA_STATE {
                 return 0;
             }
             let state = message.argument_list().map(|args| CefString::from(&args.string(0)).to_string()).unwrap_or_default();
             let id = CefString::from(&frame.identifier()).to_string();
-            self.shared.borrow_mut().set_media(id, Playback::parse(&state));
+            self.shared.borrow_mut().set_media(id, parse_playback(&state));
             1
         }
     }

@@ -7,7 +7,7 @@
 //! its side in 156 (CEF #4237), and NVIDIA frames can still arrive half
 //! drawn until Chromium 158 (CEF #4313).
 
-use crate::frames::{Frames, Surface, regions};
+use super::frames::{Frames, Surface, regions};
 use anyhow::{Context as _, Result, bail, ensure};
 use cef::{AcceleratedPaintInfo, ColorType, Rect};
 use gpui::{AtlasTileUpdate, DevicePixels, DmabufId, DmabufImport, point, size};

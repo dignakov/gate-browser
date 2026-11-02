@@ -7,7 +7,7 @@
 //! queued events get them.
 //!
 //! glib's default context (Chromium's X11 watcher) is dispatched here too,
-//! whenever its fds are ready (see [`crate::glib`]).
+//! whenever its fds are ready (see [`super::glib`]).
 
 use gpui::{App, AsyncApp};
 use std::cell::{Cell, RefCell};
@@ -66,7 +66,7 @@ pub(crate) fn start(cx: &mut App) {
         return;
     }
     #[cfg(target_os = "linux")]
-    crate::glib::start(|| {
+    super::glib::start(|| {
         if let Some(sender) = SENDER.get() {
             let _ = sender.try_send(Msg::Glib);
         }
@@ -86,7 +86,7 @@ pub(crate) fn start(cx: &mut App) {
                     }
                     Ok(Msg::Wake) => {}
                     #[cfg(target_os = "linux")]
-                    Ok(Msg::Glib) => crate::glib::dispatch(),
+                    Ok(Msg::Glib) => super::glib::dispatch(),
                     Ok(Msg::Stop) | Err(_) => break,
                 },
                 _ = timer.fuse() => due = Some(Instant::now()),
@@ -109,7 +109,7 @@ fn work() {
     WORKING.set(false);
     // CEF's work may have changed what glib waits on.
     #[cfg(target_os = "linux")]
-    crate::glib::dispatch();
+    super::glib::dispatch();
 }
 
 fn drain(cx: &mut App) {

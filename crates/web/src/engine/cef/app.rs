@@ -23,14 +23,14 @@ wrap_app! {
             // Vulkan (through ANGLE); GLX, X11's default, can't. An explicit
             // --use-angle wins.
             #[cfg(target_os = "linux")]
-            if browser && crate::gpu_frames_wanted() && command_line.has_switch(Some(&"use-angle".into())) == 0 {
+            if browser && super::gpu_frames_wanted() && command_line.has_switch(Some(&"use-angle".into())) == 0 {
                 command_line.append_switch_with_value(Some(&"use-angle".into()), Some(&"vulkan".into()));
                 command_line.append_switch_with_value(
                     Some(&"enable-features".into()),
                     Some(&"Vulkan,VulkanFromANGLE,DefaultANGLEVulkan".into()),
                 );
             }
-            let extensions = crate::EXTENSIONS.get().filter(|e| browser && !e.is_empty());
+            let extensions = super::EXTENSIONS.get().filter(|e| browser && !e.is_empty());
             if let Some(extensions) = extensions {
                 // Chromium splits the list on commas.
                 let list: Vec<_> = extensions.iter().map(|p| p.to_string_lossy()).collect();
@@ -48,7 +48,7 @@ wrap_app! {
         }
 
         fn render_process_handler(&self) -> Option<RenderProcessHandler> {
-            Some(crate::renderer::handler())
+            Some(super::renderer::handler())
         }
     }
 }
@@ -61,7 +61,7 @@ wrap_browser_process_handler! {
     impl BrowserProcessHandler {
         // Any thread: the pump turns it into work on the main thread.
         fn on_schedule_message_pump_work(&self, delay_ms: i64) {
-            crate::pump::schedule(delay_ms);
+            super::pump::schedule(delay_ms);
         }
 
         // Another launch on our profile: it hands us its arguments and exits.
@@ -74,7 +74,7 @@ wrap_browser_process_handler! {
             if let Some(command_line) = command_line {
                 command_line.arguments(Some(&mut list));
             }
-            crate::relaunched(list.into_iter().collect());
+            super::relaunched(list.into_iter().collect());
             1
         }
     }

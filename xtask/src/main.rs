@@ -35,7 +35,8 @@ fn main() -> Result<()> {
             package(&target)
         }
         Some("check-windows") => check_windows(),
-        _ => bail!("usage: cargo xtask package [--target <triple>] | cargo xtask check-windows"),
+        Some("build-wpe") => build_wpe(),
+        _ => bail!("usage: cargo xtask package [--target <triple>] | check-windows | build-wpe"),
     }
 }
 
@@ -110,6 +111,70 @@ fn package(target: &str) -> Result<()> {
         tgz
     };
     println!("{}\n{}", out.display(), archive.display());
+    Ok(())
+}
+
+/// WPE WebKit, the Linux engine: the release Gate builds against, unpacked
+/// into `third_party/wpe/` and installed to `third_party/wpe/install`.
+const WPE_VERSION: &str = "2.54.2";
+const WPE_SHA256: &str = "f3284e19e47fcb5ac8c63c2e1c113dbd65b2423eb8a545f5b345707829004f56";
+
+/// Builds WPE WebKit with only what Gate uses: the WPEPlatform API (Gate
+/// implements its own platform, so WPE's Wayland and DRM ones are off),
+/// media through GStreamer, the PDF viewer.
+fn build_wpe() -> Result<()> {
+    let dir = root().join("third_party/wpe");
+    fs::create_dir_all(&dir)?;
+    let tarball = dir.join(format!("wpewebkit-{WPE_VERSION}.tar.xz"));
+    if !tarball.is_file() {
+        run(Command::new("curl")
+            .current_dir(&dir)
+            .args(["-fL", "-o"])
+            .arg(&tarball)
+            .arg(format!("https://wpewebkit.org/releases/wpewebkit-{WPE_VERSION}.tar.xz")))?;
+    }
+    let sum = Command::new("sha256sum").arg(&tarball).output().context("running sha256sum")?;
+    let sum = String::from_utf8_lossy(&sum.stdout);
+    ensure!(sum.split_whitespace().next() == Some(WPE_SHA256), "{} doesn't match its SHA-256", tarball.display());
+    let source = dir.join(format!("wpewebkit-{WPE_VERSION}"));
+    if !source.is_dir() {
+        run(Command::new("tar").current_dir(&dir).arg("-xJf").arg(&tarball))?;
+    }
+    let build = dir.join("build");
+    let install = dir.join("install");
+    let off = [
+        "ENABLE_WPE_LEGACY_API",
+        "ENABLE_WPE_PLATFORM_DRM",
+        "ENABLE_WPE_PLATFORM_WAYLAND",
+        "ENABLE_WPE_QT_API",
+        "ENABLE_DOCUMENTATION",
+        "ENABLE_INTROSPECTION",
+        "ENABLE_JOURNALD_LOG",
+        "ENABLE_BUBBLEWRAP_SANDBOX",
+        "ENABLE_SPEECH_SYNTHESIS",
+        "ENABLE_SPELLCHECK",
+        "ENABLE_GAMEPAD",
+        "ENABLE_WEBDRIVER",
+        "USE_ATK",
+        "USE_FLITE",
+        "USE_JPEGXL",
+        "USE_LIBBACKTRACE",
+        "USE_LIBHYPHEN",
+        "USE_SYSPROF_CAPTURE",
+    ];
+    let mut configure = Command::new("cmake");
+    configure
+        .arg("-S")
+        .arg(&source)
+        .arg("-B")
+        .arg(&build)
+        .args(["-G", "Ninja", "-DPORT=WPE", "-DCMAKE_BUILD_TYPE=Release", "-DENABLE_WPE_PLATFORM=ON", "-DENABLE_WPE_PLATFORM_HEADLESS=ON"])
+        .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install.display()))
+        .args(off.iter().map(|o| format!("-D{o}=OFF")));
+    run(&mut configure).context("configuring WPE WebKit (missing -dev packages show above)")?;
+    run(Command::new("cmake").arg("--build").arg(&build)).context("building WPE WebKit")?;
+    run(Command::new("cmake").arg("--install").arg(&build)).context("installing WPE WebKit")?;
+    println!("{}", install.display());
     Ok(())
 }
 
