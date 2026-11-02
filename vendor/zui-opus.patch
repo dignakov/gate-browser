@@ -336,3 +336,134 @@ index a6f3787..0000000
 -#define RT_MANIFEST 24
 -1 RT_MANIFEST "resources/windows/gpui.manifest.xml"
 \ No newline at end of file
+diff --git a/crates/gpui_windows/src/directx_atlas.rs b/crates/gpui_windows/src/directx_atlas.rs
+index 6238699..6012bdf 100644
+--- a/crates/gpui_windows/src/directx_atlas.rs
++++ b/crates/gpui_windows/src/directx_atlas.rs
+@@ -9,9 +9,10 @@ use windows::Win32::Graphics::{
+     Dxgi::Common::*,
+ };
+ 
++use anyhow::ensure;
+ use gpui::{
+-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
+-    PlatformAtlas, Point, Size,
++    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, AtlasTileUpdate,
++    Bounds, DevicePixels, PlatformAtlas, Point, Size,
+ };
+ 
+ pub(crate) struct DirectXAtlas(Mutex<DirectXAtlasState>);
+@@ -95,6 +96,94 @@ impl PlatformAtlas for DirectXAtlas {
+         }
+     }
+ 
++    /// A tile whose pixels only arrive through [`Self::update_tile`].
++    fn insert_blank(
++        &self,
++        key: &AtlasKey,
++        size: Size<DevicePixels>,
++    ) -> anyhow::Result<Option<bool>> {
++        let mut lock = self.0.lock();
++        if lock.tiles_by_key.contains_key(key) {
++            return Ok(Some(false));
++        }
++        let tile = lock
++            .allocate(size, key.texture_kind())
++            .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
++        lock.tiles_by_key.insert(key.clone(), tile);
++        Ok(Some(true))
++    }
++
++    /// Writes BGRA rows into part of a color tile. `UpdateSubresource` on the
++    /// immediate context copies the source before it returns, so the update
++    /// is complete (its bytes no longer read) at once.
++    fn update_tile(
++        &self,
++        key: &AtlasKey,
++        region: Bounds<DevicePixels>,
++        update: AtlasTileUpdate<'_>,
++        on_complete: Option<Box<dyn FnOnce() + Send>>,
++    ) -> anyhow::Result<bool> {
++        let result = (|| {
++            let lock = self.0.lock();
++            let Some(tile) = lock.tiles_by_key.get(key).copied() else {
++                return Ok(false);
++            };
++            // Only color tiles are BGRA, as the pixels are.
++            if tile.texture_id.kind != AtlasTextureKind::Polychrome {
++                return Ok(false);
++            }
++            let AtlasTileUpdate::Pixels {
++                bytes,
++                bytes_per_row,
++            } = update;
++            let tile_size = tile.bounds.size;
++            ensure!(
++                region.origin.x.0 >= 0
++                    && region.origin.y.0 >= 0
++                    && region.size.width.0 > 0
++                    && region.size.height.0 > 0
++                    && region.origin.x.0 + region.size.width.0 <= tile_size.width.0
++                    && region.origin.y.0 + region.size.height.0 <= tile_size.height.0,
++                "region {region:?} lies outside the {tile_size:?} tile"
++            );
++            let row = region.size.width.0 as usize * 4;
++            let rows = region.size.height.0 as usize;
++            let stride = bytes_per_row as usize;
++            ensure!(
++                stride >= row && bytes.len() >= stride * (rows - 1) + row,
++                "{} bytes cannot hold {rows} rows of {row} bytes, {stride} apart",
++                bytes.len()
++            );
++            let bounds = Bounds {
++                origin: tile.bounds.origin + region.origin,
++                size: region.size,
++            };
++            let texture = lock.texture(tile.texture_id);
++            unsafe {
++                lock.device_context.UpdateSubresource(
++                    &texture.texture,
++                    0,
++                    Some(&D3D11_BOX {
++                        left: bounds.left().0 as u32,
++                        top: bounds.top().0 as u32,
++                        front: 0,
++                        right: bounds.right().0 as u32,
++                        bottom: bounds.bottom().0 as u32,
++                        back: 1,
++                    }),
++                    bytes.as_ptr() as _,
++                    bytes_per_row,
++                    0,
++                );
++            }
++            Ok(true)
++        })();
++        if let Some(complete) = on_complete {
++            complete();
++        }
++        result
++    }
++
+     fn remove(&self, key: &AtlasKey) {
+         let mut lock = self.0.lock();
+ 
+diff --git a/crates/gpui_windows/src/window.rs b/crates/gpui_windows/src/window.rs
+index a2ef0d3..a338748 100644
+--- a/crates/gpui_windows/src/window.rs
++++ b/crates/gpui_windows/src/window.rs
+@@ -898,10 +898,13 @@ impl PlatformWindow for WindowsWindow {
+         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
+     }
+ 
++    /// Maximizes, or restores a maximized window, as macOS's zoom and the
++    /// other platforms' do.
+     fn zoom(&self) {
+         unsafe {
+             if IsWindowVisible(self.0.hwnd).as_bool() {
+-                ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE).ok().log_err();
++                let show = if IsZoomed(self.0.hwnd).as_bool() { SW_RESTORE } else { SW_MAXIMIZE };
++                ShowWindowAsync(self.0.hwnd, show).ok().log_err();
+             } else if let Some(mut status) = self.state.initial_placement.take() {
+                 status.state = WindowOpenState::Maximized;
+                 self.state.initial_placement.set(Some(status));

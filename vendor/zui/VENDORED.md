@@ -31,3 +31,9 @@ with the new snapshot (keep this file), apply the patch, resolve conflicts.
   manifest's absolute path. The checked-in script named it relative to the
   crate, which llvm-rc (cross-building from Linux) resolves from OUT_DIR
   and couldn't find.
+- `gpui_windows/src/directx_atlas.rs`: `insert_blank` and `update_tile`
+  (in-place pixel updates of color tiles), which only the wgpu atlas had.
+  Without them nothing drawn through `Window::update_image` showed on
+  Windows (web pages stayed blank).
+- `gpui_windows/src/window.rs`: `zoom()` restores a maximized window, as on
+  macOS and Linux; it only ever maximized.

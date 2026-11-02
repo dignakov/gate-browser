@@ -74,13 +74,17 @@ pub fn resize_borders(window: &Window) -> Vec<AnyElement> {
 /// Makes empty chrome move the window when dragged and maximize it on a
 /// double click. Controls inside stop the press themselves.
 pub fn window_drag(el: gpui::Stateful<Div>) -> gpui::Stateful<Div> {
-    el.on_mouse_down(MouseButton::Left, |ev, window, _cx| {
-        if ev.click_count >= 2 {
-            window.zoom_window();
-        } else {
-            window.start_window_move();
-        }
-    })
+    // Windows: the system moves it (and snaps it, and maximizes it on a
+    // double click), as a title bar. Buttons inside must occlude it.
+    el.window_control_area(gpui::WindowControlArea::Drag)
+        // Elsewhere, the app starts the move.
+        .on_mouse_down(MouseButton::Left, |ev, window, _cx| {
+            if ev.click_count >= 2 {
+                window.zoom_window();
+            } else {
+                window.start_window_move();
+            }
+        })
 }
 
 /// Close, minimize, maximize: macOS-style lights that show their glyphs
@@ -107,7 +111,10 @@ pub fn traffic_lights(vertical: bool) -> impl IntoElement {
             .on_click(move |_: &ClickEvent, window, cx| action(window, cx))
     };
     div()
+        .id("traffic-lights")
         .group("lights")
+        // Not part of a drag area around it (see `window_drag`).
+        .occlude()
         .flex()
         .when(vertical, |d| d.flex_col())
         .items_center()
@@ -139,6 +146,8 @@ fn button(id: ElementId, group: SharedString, icon: &'static str, size: f32, gly
         .justify_center()
         .size(px(size))
         .rounded(px(if size > 24.0 { theme::CONTROL_RADIUS } else { 4.0 }))
+        // Header buttons sit in drag areas (see `window_drag`).
+        .when(size > 24.0, |b| b.occlude())
         .hover(move |s| s.bg(ink.hover))
         .active(move |s| s.bg(ink.selected))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

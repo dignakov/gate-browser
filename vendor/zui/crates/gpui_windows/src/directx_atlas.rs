@@ -9,9 +9,10 @@ use windows::Win32::Graphics::{
     Dxgi::Common::*,
 };
 
+use anyhow::ensure;
 use gpui::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, AtlasTileUpdate,
+    Bounds, DevicePixels, PlatformAtlas, Point, Size,
 };
 
 pub(crate) struct DirectXAtlas(Mutex<DirectXAtlasState>);
@@ -93,6 +94,94 @@ impl PlatformAtlas for DirectXAtlas {
             lock.tiles_by_key.insert(key.clone(), tile);
             Ok(Some(tile))
         }
+    }
+
+    /// A tile whose pixels only arrive through [`Self::update_tile`].
+    fn insert_blank(
+        &self,
+        key: &AtlasKey,
+        size: Size<DevicePixels>,
+    ) -> anyhow::Result<Option<bool>> {
+        let mut lock = self.0.lock();
+        if lock.tiles_by_key.contains_key(key) {
+            return Ok(Some(false));
+        }
+        let tile = lock
+            .allocate(size, key.texture_kind())
+            .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
+        lock.tiles_by_key.insert(key.clone(), tile);
+        Ok(Some(true))
+    }
+
+    /// Writes BGRA rows into part of a color tile. `UpdateSubresource` on the
+    /// immediate context copies the source before it returns, so the update
+    /// is complete (its bytes no longer read) at once.
+    fn update_tile(
+        &self,
+        key: &AtlasKey,
+        region: Bounds<DevicePixels>,
+        update: AtlasTileUpdate<'_>,
+        on_complete: Option<Box<dyn FnOnce() + Send>>,
+    ) -> anyhow::Result<bool> {
+        let result = (|| {
+            let lock = self.0.lock();
+            let Some(tile) = lock.tiles_by_key.get(key).copied() else {
+                return Ok(false);
+            };
+            // Only color tiles are BGRA, as the pixels are.
+            if tile.texture_id.kind != AtlasTextureKind::Polychrome {
+                return Ok(false);
+            }
+            let AtlasTileUpdate::Pixels {
+                bytes,
+                bytes_per_row,
+            } = update;
+            let tile_size = tile.bounds.size;
+            ensure!(
+                region.origin.x.0 >= 0
+                    && region.origin.y.0 >= 0
+                    && region.size.width.0 > 0
+                    && region.size.height.0 > 0
+                    && region.origin.x.0 + region.size.width.0 <= tile_size.width.0
+                    && region.origin.y.0 + region.size.height.0 <= tile_size.height.0,
+                "region {region:?} lies outside the {tile_size:?} tile"
+            );
+            let row = region.size.width.0 as usize * 4;
+            let rows = region.size.height.0 as usize;
+            let stride = bytes_per_row as usize;
+            ensure!(
+                stride >= row && bytes.len() >= stride * (rows - 1) + row,
+                "{} bytes cannot hold {rows} rows of {row} bytes, {stride} apart",
+                bytes.len()
+            );
+            let bounds = Bounds {
+                origin: tile.bounds.origin + region.origin,
+                size: region.size,
+            };
+            let texture = lock.texture(tile.texture_id);
+            unsafe {
+                lock.device_context.UpdateSubresource(
+                    &texture.texture,
+                    0,
+                    Some(&D3D11_BOX {
+                        left: bounds.left().0 as u32,
+                        top: bounds.top().0 as u32,
+                        front: 0,
+                        right: bounds.right().0 as u32,
+                        bottom: bounds.bottom().0 as u32,
+                        back: 1,
+                    }),
+                    bytes.as_ptr() as _,
+                    bytes_per_row,
+                    0,
+                );
+            }
+            Ok(true)
+        })();
+        if let Some(complete) = on_complete {
+            complete();
+        }
+        result
     }
 
     fn remove(&self, key: &AtlasKey) {
