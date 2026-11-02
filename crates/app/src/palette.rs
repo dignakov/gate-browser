@@ -146,14 +146,7 @@ fn word_score(word: &str, text: &str) -> Option<i32> {
 impl Workspace {
     pub fn open_palette(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
         self.settings = None;
-        let input = cx.new(|cx| {
-            let mut input = TextInput::new(intent.placeholder(), window, cx);
-            input.text_color = theme::text().into();
-            input.placeholder_color = theme::text_dim().into();
-            input.selection_color = theme::accent_soft().into();
-            input.cursor_color = theme::accent().into();
-            input
-        });
+        let input = cx.new(|cx| TextInput::new(intent.placeholder(), window, cx));
         let events = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
             InputEvent::Changed => this.refresh_palette(cx),
             InputEvent::Submit(_) => this.run_choice(None, window, cx),

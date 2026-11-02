@@ -127,6 +127,14 @@ fn relaunched(args: Vec<String>) {
     pump::wake();
 }
 
+/// Pages prefer dark, or light: Chromium's color scheme for the profile.
+pub(crate) fn set_dark_mode(dark: bool) {
+    let variant = if dark { sys::cef_color_variant_t::CEF_COLOR_VARIANT_DARK } else { sys::cef_color_variant_t::CEF_COLOR_VARIANT_LIGHT };
+    if let Some(context) = request_context_get_global_context() {
+        context.set_chrome_color_scheme(variant.into(), 0);
+    }
+}
+
 /// Shuts CEF down. Every page must have been closed.
 pub(crate) fn shutdown() {
     pump::stop();

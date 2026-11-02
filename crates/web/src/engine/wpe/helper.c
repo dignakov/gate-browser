@@ -914,12 +914,15 @@ static void clear_media(Page *p) {
     report_playback(p);
 }
 
+static void fetch_svg_icon(Page *p);
 static void loaded(WebKitWebView *web, WebKitLoadEvent event, Page *p) {
     if (event == WEBKIT_LOAD_STARTED)
         g_clear_pointer(&p->error, g_free);
     // A new document: its frames' media scripts start over.
     if (event == WEBKIT_LOAD_COMMITTED)
         clear_media(p);
+    if (event == WEBKIT_LOAD_FINISHED)
+        fetch_svg_icon(p);
     state(p);
 }
 static gboolean failed(WebKitWebView *web, WebKitLoadEvent event, const char *uri, GError *error,
@@ -1096,6 +1099,9 @@ static void favicon(GObject *web, GParamSpec *spec, Page *p) {
     }
     if (!best) {
         send_packet('G', p->id, NULL, 0);
+        // Once loaded, an SVG icon (sent after this) may stand in.
+        if (!webkit_web_view_is_loading(p->web))
+            fetch_svg_icon(p);
         return;
     }
     guint32 width = webkit_image_get_width(best), height = webkit_image_get_height(best);
@@ -1115,6 +1121,44 @@ static void favicon(GObject *web, GParamSpec *spec, Page *p) {
         memcpy(packet + 8 + (gsize)y * width * 4, data + (gsize)y * stride, (gsize)width * 4);
     send_packet('G', p->id, packet, length);
     g_free(packet);
+}
+// WebKit's icon database decodes bitmaps only: a page whose icon is an SVG
+// (`<link rel=icon href=x.svg>`) gets none. Its SVG is fetched from the page
+// and sent as text (`Y`); Gate rasterizes it. Asked for when the page has
+// loaded and when WebKit reports no icon after that.
+static const char SVG_ICON_JS[] =
+    "const link = [...document.querySelectorAll('link[rel~=\"icon\" i]')]"
+    "  .find(l => /svg/i.test(l.type) || /\\.svg([?#]|$)/i.test(l.href));"
+    "if (!link) return null;"
+    "const response = await fetch(link.href);"
+    "if (!response.ok) return null;"
+    "return { page: location.href, svg: await response.text() };";
+static void svg_icon_fetched(GObject *web, GAsyncResult *result, gpointer data) {
+    JSCValue *v = webkit_web_view_call_async_javascript_function_finish(WEBKIT_WEB_VIEW(web), result, NULL);
+    Page *p = g_hash_table_lookup(pages, data);
+    WebKitImageList *icons = p ? webkit_web_view_get_page_icons(p->web) : NULL;
+    // Still the page it was fetched for, and still without a bitmap icon.
+    if (p && v && jsc_value_is_object(v) && !(icons && webkit_image_list_get_length(icons))) {
+        JSCValue *page = jsc_value_object_get_property(v, "page");
+        JSCValue *svg = jsc_value_object_get_property(v, "svg");
+        gchar *page_uri = jsc_value_to_string(page);
+        gchar *text = jsc_value_to_string(svg);
+        gsize length = strlen(text);
+        if (!g_strcmp0(page_uri, webkit_web_view_get_uri(p->web)) && length && length <= 256 * 1024)
+            send_packet('Y', p->id, text, length);
+        g_free(page_uri);
+        g_free(text);
+        g_object_unref(page);
+        g_object_unref(svg);
+    }
+    g_clear_object(&v);
+}
+static void fetch_svg_icon(Page *p) {
+    WebKitImageList *icons = webkit_web_view_get_page_icons(p->web);
+    if (icons && webkit_image_list_get_length(icons))
+        return;
+    webkit_web_view_call_async_javascript_function(p->web, SVG_ICON_JS, -1, NULL, MEDIA_WORLD, NULL,
+                                                   NULL, svg_icon_fetched, GUINT_TO_POINTER(p->id));
 }
 static void capture(GObject *web, GParamSpec *spec, Page *p) {
     gboolean camera = webkit_web_view_get_camera_capture_state(p->web) == WEBKIT_MEDIA_CAPTURE_STATE_ACTIVE;
@@ -1498,6 +1542,12 @@ static void command(JsonObject *o) {
         return;
     if (!strcmp(cmd, "clipboard")) {
         set_system_clipboard(wpe_display_get_clipboard(display), string(o, "text"));
+        return;
+    }
+    if (!strcmp(cmd, "theme")) {
+        // Every page's prefers-color-scheme.
+        wpe_settings_set_boolean(wpe_display_get_settings(display), WPE_SETTING_DARK_MODE,
+                                 number(o, "dark") != 0, WPE_SETTINGS_SOURCE_APPLICATION, NULL);
         return;
     }
     Page *p = g_hash_table_lookup(pages, GUINT_TO_POINTER(id));

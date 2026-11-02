@@ -7,6 +7,7 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString,
     Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
+use crate::theme;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -56,10 +57,10 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    pub text_color: Hsla,
-    pub placeholder_color: Hsla,
-    pub selection_color: Hsla,
-    pub cursor_color: Hsla,
+    /// Colors for text on something other than the theme's surfaces
+    /// (`None`: the theme's).
+    pub text_color: Option<Hsla>,
+    pub placeholder_color: Option<Hsla>,
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -89,10 +90,8 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            text_color: gpui::white(),
-            placeholder_color: gpui::white().opacity(0.4),
-            selection_color: gpui::white().opacity(0.2),
-            cursor_color: gpui::white(),
+            text_color: None,
+            placeholder_color: None,
         }
     }
 
@@ -472,9 +471,9 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), input.placeholder_color)
+            (input.placeholder.clone(), input.placeholder_color.unwrap_or_else(|| theme::text_dim().into()))
         } else {
-            (content, input.text_color)
+            (content, input.text_color.unwrap_or_else(|| theme::text().into()))
         };
 
         let run = TextRun {
@@ -512,7 +511,7 @@ impl Element for TextElement {
                 None,
                 Some(fill(
                     Bounds::new(point(bounds.left() + cursor_x - shift, bounds.top()), size(px(1.5), bounds.size.height)),
-                    input.cursor_color,
+                    Hsla::from(theme::accent()),
                 )),
             )
         } else {
@@ -522,7 +521,7 @@ impl Element for TextElement {
                         point(bounds.left() + line.x_for_index(selected_range.start) - shift, bounds.top()),
                         point(bounds.left() + line.x_for_index(selected_range.end) - shift, bounds.bottom()),
                     ),
-                    input.selection_color,
+                    Hsla::from(theme::accent_soft()),
                 )),
                 None,
             )

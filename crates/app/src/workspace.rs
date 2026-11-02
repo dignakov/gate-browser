@@ -229,14 +229,7 @@ impl Focusable for Workspace {
 
 impl Workspace {
     pub fn new(urls: Vec<String>, store: Store, db: Db, session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let address = cx.new(|cx| {
-            let mut input = TextInput::new("Search or enter address", window, cx);
-            input.text_color = theme::text().into();
-            input.placeholder_color = theme::text_dim().into();
-            input.selection_color = theme::accent_soft().into();
-            input.cursor_color = theme::accent().into();
-            input
-        });
+        let address = cx.new(|cx| TextInput::new("Search or enter address", window, cx));
         let address_events = cx.subscribe_in(&address, window, Self::address_event);
         let mut this = Self {
             tabs: Vec::new(),
@@ -290,6 +283,9 @@ impl Workspace {
             }
         })
         .detach();
+        // Before the first page: pages start in the theme.
+        this.apply_theme(window, cx);
+        cx.observe_window_appearance(window, |ws, window, cx| ws.apply_theme(window, cx)).detach();
         this.restore(session, window, cx);
         // Pages asked for on the command line open as new spaces; with
         // nothing open at all, the palette asks where to go.
@@ -299,6 +295,16 @@ impl Workspace {
             this.activate(this.active, window, cx);
         }
         this
+    }
+
+    /// Light or dark, as Settings › Look › Theme and the system say: for
+    /// Gate and for the pages.
+    pub fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dark = self.store.settings.theme.dark(window.appearance());
+        web::set_dark_mode(dark);
+        if theme::set_dark(dark) {
+            cx.notify();
+        }
     }
 
     /// Keeps the background's images made for the window's size and the
@@ -349,8 +355,8 @@ impl Workspace {
         }
         self.ink = ink;
         self.address.update(cx, |input, cx| {
-            input.text_color = ink.text.into();
-            input.placeholder_color = ink.dim.into();
+            input.text_color = Some(ink.text.into());
+            input.placeholder_color = Some(ink.dim.into());
             cx.notify();
         });
     }
@@ -540,9 +546,6 @@ impl Workspace {
         };
         let input = cx.new(|cx| {
             let mut input = TextInput::new("", window, cx);
-            input.text_color = theme::text().into();
-            input.selection_color = theme::accent_soft().into();
-            input.cursor_color = theme::accent().into();
             input.set_text(default, cx);
             input
         });
@@ -811,10 +814,6 @@ impl Workspace {
         let (id, current) = (tab.id, self.space_name(tab, cx));
         let input = cx.new(|cx| {
             let mut input = TextInput::new("Name this space", window, cx);
-            input.text_color = theme::text().into();
-            input.placeholder_color = theme::text_dim().into();
-            input.selection_color = theme::accent_soft().into();
-            input.cursor_color = theme::accent().into();
             input.set_text(current, cx);
             input
         });

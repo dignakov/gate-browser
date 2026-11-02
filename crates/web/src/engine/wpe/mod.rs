@@ -45,6 +45,21 @@ static PROFILE: OnceLock<PathBuf> = OnceLock::new();
 /// The running helper, started with the first page.
 static WORKER: Mutex<Option<Arc<Worker>>> = Mutex::new(None);
 
+/// Pages prefer dark (see [`crate::set_dark_mode`]).
+static DARK: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_dark_mode(dark: bool) {
+    if DARK.swap(dark, Ordering::Relaxed) != dark
+        && let Some(worker) = WORKER.lock().unwrap().as_ref()
+    {
+        worker.send(0, theme_command());
+    }
+}
+
+fn theme_command() -> Value {
+    json!({"cmd":"theme","dark":u8::from(DARK.load(Ordering::Relaxed))})
+}
+
 /// Starts the engine: claims the profile for this process (or hands this
 /// launch to the process that has it).
 pub(crate) fn init(profile: &Path, cx: &mut gpui::App) -> Result<Started> {
@@ -183,6 +198,8 @@ pub(super) fn add_page(events: Events, gpu: Option<gpui::DmabufTarget>) -> (Arc<
 /// runs; if it never does, its pages hear that it stopped.
 fn start(gpu: Option<gpui::DmabufTarget>) -> Arc<Worker> {
     let (outbox, commands) = present::outbox();
+    // Pages are made in the theme.
+    let _ = outbox.send(0, theme_command());
     let worker = Arc::new(Worker {
         outbox: outbox.clone(),
         routes: Arc::default(),
@@ -362,6 +379,11 @@ fn packet(route: &Route, outbox: &Outbox, page: u32, kind: u8, data: &[u8], read
             }
         }
         b'G' => route.send(PageEvent::Favicon(favicon(data))),
+        b'Y' => {
+            if let Some(icon) = svg_favicon(data) {
+                route.send(PageEvent::Favicon(Some(icon)));
+            }
+        }
         b'A' => route.send(PageEvent::Ask(json().as_ref().and_then(ask))),
         b'W' => {
             if let Some(v) = json() {
@@ -445,6 +467,33 @@ fn favicon(data: &[u8]) -> Option<Arc<gpui::RenderImage>> {
         }
     }
     let buffer = image::RgbaImage::from_raw(width, height, pixels)?;
+    Some(Arc::new(gpui::RenderImage::new([image::Frame::new(buffer)])))
+}
+
+/// The side of a rasterized SVG icon, in pixels.
+const SVG_ICON_SIZE: u32 = 64;
+
+/// A page's SVG icon (`Y`: its source), rasterized.
+fn svg_favicon(data: &[u8]) -> Option<Arc<gpui::RenderImage>> {
+    let tree = resvg::usvg::Tree::from_data(data, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let scale = SVG_ICON_SIZE as f32 / size.width().max(size.height());
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(SVG_ICON_SIZE, SVG_ICON_SIZE)?;
+    // Centered, the longer side filling the square.
+    let (dx, dy) = ((SVG_ICON_SIZE as f32 - size.width() * scale) / 2.0, (SVG_ICON_SIZE as f32 - size.height() * scale) / 2.0);
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy), &mut pixmap.as_mut());
+    // Premultiplied RGBA; GPUI wants straight BGRA.
+    let mut pixels = pixmap.take();
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u32;
+        if alpha > 0 && alpha < 255 {
+            for c in &mut pixel[..3] {
+                *c = ((*c as u32 * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+        pixel.swap(0, 2);
+    }
+    let buffer = image::RgbaImage::from_raw(SVG_ICON_SIZE, SVG_ICON_SIZE, pixels)?;
     Some(Arc::new(gpui::RenderImage::new([image::Frame::new(buffer)])))
 }
 

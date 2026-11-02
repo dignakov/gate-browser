@@ -11,6 +11,8 @@ pub struct Settings {
     pub ad_blocking: bool,
     /// Download new uBlock Origin Lite releases (applied at the next start).
     pub ublock_auto_update: bool,
+    /// Light or dark, for Gate and the pages' `prefers-color-scheme`.
+    pub theme: Theme,
     /// The sidebar as a floating card (as the panes), not an edge panel.
     pub floating_sidebar: bool,
     /// Behind the sidebar and the panes.
@@ -32,12 +34,34 @@ impl Default for Settings {
         Self {
             ad_blocking: true,
             ublock_auto_update: true,
+            theme: Theme::System,
             floating_sidebar: false,
             background: Default::default(),
             wallpaper_dir: None,
             chrome_opacity: 1.0,
             blur: 30.0,
             gpu_frames: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    /// As the system's appearance.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// Dark or not, given the system's appearance.
+    pub fn dark(self, appearance: gpui::WindowAppearance) -> bool {
+        match self {
+            Self::System => matches!(appearance, gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark),
+            Self::Light => false,
+            Self::Dark => true,
         }
     }
 }

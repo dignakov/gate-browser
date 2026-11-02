@@ -17,7 +17,13 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Background {
-    Solid { color: u32 },
+    /// One color per theme (`None`: the theme's own background).
+    Solid {
+        #[serde(alias = "color", default, skip_serializing_if = "Option::is_none")]
+        dark: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        light: Option<u32>,
+    },
     /// Two or three colors (0xRRGGBB) along `angle` degrees, as CSS's
     /// `linear-gradient` (0: bottom to top, 90: left to right, 180: top to
     /// bottom).
@@ -27,7 +33,19 @@ pub enum Background {
 
 impl Default for Background {
     fn default() -> Self {
-        Self::Solid { color: 0x131518 }
+        Self::Solid { dark: None, light: None }
+    }
+}
+
+impl Background {
+    /// A solid background's color (0xRRGGBB) in the theme in use.
+    pub fn solid(&self) -> Option<u32> {
+        let Self::Solid { dark, light } = self else { return None };
+        Some(if crate::theme::dark() {
+            dark.unwrap_or(crate::theme::DARK_PALETTE.canvas)
+        } else {
+            light.unwrap_or(crate::theme::LIGHT_PALETTE.canvas)
+        })
     }
 }
 
@@ -49,8 +67,9 @@ pub const PRESETS: &[Preset] = &[
     Preset { name: "Dusk", colors: &[0x232b45, 0x8a4f7d, 0xf1916d], angle: 170.0 },
 ];
 
-/// Solid colors offered as swatches.
-pub const SWATCHES: &[u32] = &[0x131518, 0x0e0f12, 0x1b1d23, 0x1a1626, 0x10201f, 0x221a17, 0x1c2433, 0x2a2a2e];
+/// Solid colors offered as swatches, in the dark theme and the light one.
+pub const DARK_SWATCHES: &[u32] = &[0x131518, 0x0e0f12, 0x1b1d23, 0x1a1626, 0x10201f, 0x221a17, 0x1c2433, 0x2a2a2e];
+pub const LIGHT_SWATCHES: &[u32] = &[0xe9eaee, 0xf6f6f8, 0xdedfe4, 0xe7e3f0, 0xdfebe7, 0xf0e7e0, 0xdce4ef, 0xd4d4d8];
 
 /// What a render was made from: a new one is needed when it changes.
 #[derive(Clone, Debug, PartialEq)]
@@ -93,7 +112,7 @@ pub fn render(key: &Key) -> anyhow::Result<Option<Rendered>> {
 /// A small picture of a background, for Settings.
 pub fn thumbnail(background: &Background, w: u32, h: u32) -> anyhow::Result<Arc<RenderImage>> {
     Ok(bgra(match background {
-        Background::Solid { color } => RgbaImage::from_pixel(w, h, rgba(*color)),
+        Background::Solid { .. } => RgbaImage::from_pixel(w, h, rgba(background.solid().unwrap_or_default())),
         Background::Gradient { colors, angle } => gradient(colors, *angle, w, h),
         Background::Wallpaper { path } => {
             let image = image::open(path)?;

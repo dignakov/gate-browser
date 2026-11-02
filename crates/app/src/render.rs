@@ -3,7 +3,6 @@
 
 use crate::activity::{self, Kind};
 use crate::chrome::{self, icon_button, icon_glyph, small_button};
-use crate::backdrop::Background;
 use crate::palette::Intent;
 use crate::workspace::{DRAG_THRESHOLD, DividerDrag, DropTarget, PaneDrag, SidebarDrag, Tab, Workspace};
 use crate::theme::Ink;
@@ -71,10 +70,7 @@ impl Render for Workspace {
 
         self.sync_backdrop(vw, vh, window.scale_factor(), cx);
         let settings = &self.store.settings;
-        let canvas = match settings.background {
-            Background::Solid { color } => gpui::rgb(color),
-            _ => theme::canvas(),
-        };
+        let canvas = settings.background.solid().map(gpui::rgb).unwrap_or_else(theme::canvas);
         let backdrop = self.backdrop.as_ref();
         let sharp = backdrop.map(|b| b.sharp.clone());
         let blurred = backdrop.and_then(|b| b.blurred.clone());
@@ -83,9 +79,9 @@ impl Render for Workspace {
         let tint = gpui::Rgba { a: opacity, ..theme::chrome() };
         // Its text, readable on what actually shows through: the tint over
         // the background's average under it.
-        let under = match (&settings.background, backdrop) {
-            (Background::Solid { color }, _) => gpui::rgb(*color),
-            (_, Some(b)) => crate::backdrop::average(&b.sharp, [inset / vw, inset / vh, (inset + side) / vw, (vh - inset) / vh])
+        let under = match (settings.background.solid(), backdrop) {
+            (Some(color), _) => gpui::rgb(color),
+            (None, Some(b)) => crate::backdrop::average(&b.sharp, [inset / vw, inset / vh, (inset + side) / vw, (vh - inset) / vh])
                 .map(gpui::rgb)
                 .unwrap_or_else(theme::canvas),
             _ => theme::canvas(),

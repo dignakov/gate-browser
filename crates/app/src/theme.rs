@@ -1,29 +1,85 @@
-//! The look: herdr's dark panels and proportions, with zeron's accent.
-//! Colors were taken from herdr's running window (its derived palette).
+//! The look: herdr's panels and proportions, with zeron's accent. The dark
+//! colors were taken from herdr's running window (its derived palette); the
+//! light ones mirror them.
 
 use gpui::{Hsla, Rgba, hsla, rgb, rgba};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const FONT: &str = "Geist";
 
-/// Behind the pane cards (the work area's gaps).
+/// Which palette is in use: Settings › Look › Theme, or the system's.
+static DARK: AtomicBool = AtomicBool::new(true);
+
+pub fn dark() -> bool {
+    DARK.load(Ordering::Relaxed)
+}
+
+/// Switches palettes; whether that changed anything.
+pub fn set_dark(dark: bool) -> bool {
+    DARK.swap(dark, Ordering::Relaxed) != dark
+}
+
+/// One theme's surfaces and ink.
+pub struct Palette {
+    /// Behind the pane cards (the work area's gaps), and the plain background.
+    pub canvas: u32,
+    /// The sidebar.
+    pub chrome: u32,
+    /// Pane cards and their headers.
+    pub surface: u32,
+    /// Cards floating over a page (questions it asks), the dialogs.
+    pub popover: u32,
+    /// Hovers, washes and hairlines are this ink, faint.
+    pub wash: f32,
+    pub text: u32,
+    pub muted: u32,
+    pub dim: u32,
+}
+
+/// herdr's dark panels.
+pub const DARK_PALETTE: Palette = Palette {
+    canvas: 0x131518,
+    chrome: 0x101114,
+    surface: 0x17191d,
+    popover: 0x202227,
+    wash: 1.0,
+    text: 0xeeeeef,
+    muted: 0x9b9c9f,
+    dim: 0x66676a,
+};
+
+/// The same, in daylight.
+pub const LIGHT_PALETTE: Palette = Palette {
+    canvas: 0xe9eaee,
+    chrome: 0xf5f5f7,
+    surface: 0xfbfbfc,
+    popover: 0xffffff,
+    wash: 0.0,
+    text: 0x18191c,
+    muted: 0x55565c,
+    dim: 0x7c7d83,
+};
+
+pub fn palette() -> &'static Palette {
+    if dark() { &DARK_PALETTE } else { &LIGHT_PALETTE }
+}
+
 pub fn canvas() -> Rgba {
-    rgb(0x131518)
+    rgb(palette().canvas)
 }
-/// The sidebar.
 pub fn chrome() -> Rgba {
-    rgb(0x101114)
+    rgb(palette().chrome)
 }
-/// Pane cards and their headers.
 pub fn surface() -> Rgba {
-    rgb(0x17191d)
+    rgb(palette().surface)
 }
-/// Cards floating over a page (questions it asks).
 pub fn popover() -> Rgba {
-    rgb(0x202227)
+    rgb(palette().popover)
 }
-/// White ink at `alpha`: hovers, washes, hairlines.
+/// The ink (white on dark, black on light) at `alpha`: hovers, washes,
+/// hairlines.
 pub fn wash(alpha: f32) -> Hsla {
-    hsla(0.0, 0.0, 1.0, alpha)
+    hsla(0.0, 0.0, palette().wash, alpha)
 }
 pub fn border() -> Hsla {
     wash(0.094)
@@ -35,13 +91,13 @@ pub fn selected() -> Hsla {
     wash(0.09)
 }
 pub fn text() -> Rgba {
-    rgb(0xeeeeef)
+    rgb(palette().text)
 }
 pub fn text_muted() -> Rgba {
-    rgb(0x9b9c9f)
+    rgb(palette().muted)
 }
 pub fn text_dim() -> Rgba {
-    rgb(0x66676a)
+    rgb(palette().dim)
 }
 pub fn accent() -> Rgba {
     rgb(0x8b7cf6)
@@ -143,25 +199,16 @@ impl Ink {
     pub fn over(background: Rgba, see_through: f32) -> Self {
         let margin = 1.0 + see_through.clamp(0.0, 1.0) * 1.5;
         let (muted_goal, dim_goal) = (MUTED_CONTRAST * margin, DIM_CONTRAST * margin);
+        // Light ink on dark backgrounds, dark ink on light ones, whatever the theme.
         let light = contrast(rgb(0xffffff), background) >= contrast(rgb(0x000000), background);
-        if light {
-            let text = text();
-            Self {
-                text,
-                muted: toward(text_muted(), text, background, muted_goal),
-                dim: toward(text_dim(), text, background, dim_goal),
-                hover: hover(),
-                selected: selected(),
-            }
-        } else {
-            let text = rgb(0x141518);
-            Self {
-                text,
-                muted: toward(rgb(0x4a4b50), text, background, muted_goal),
-                dim: toward(rgb(0x6b6c70), text, background, dim_goal),
-                hover: hsla(0.0, 0.0, 0.0, 0.06),
-                selected: hsla(0.0, 0.0, 0.0, 0.1),
-            }
+        let p = if light { &DARK_PALETTE } else { &LIGHT_PALETTE };
+        let (text, ink) = (rgb(p.text), p.wash);
+        Self {
+            text,
+            muted: toward(rgb(p.muted), text, background, muted_goal),
+            dim: toward(rgb(p.dim), text, background, dim_goal),
+            hover: hsla(0.0, 0.0, ink, 0.055),
+            selected: hsla(0.0, 0.0, ink, 0.09),
         }
     }
 }
@@ -197,7 +244,11 @@ mod tests {
 
     #[test]
     fn opaque_sidebar_keeps_its_colors() {
-        assert_eq!(Ink::over(chrome(), 0.0), Ink::standard());
+        for p in [&DARK_PALETTE, &LIGHT_PALETTE] {
+            let ink = Ink::over(rgb(p.chrome), 0.0);
+            assert_eq!((ink.text, ink.muted, ink.dim), (rgb(p.text), rgb(p.muted), rgb(p.dim)));
+            assert_eq!((ink.hover, ink.selected), (hsla(0.0, 0.0, p.wash, 0.055), hsla(0.0, 0.0, p.wash, 0.09)));
+        }
     }
 
     #[test]

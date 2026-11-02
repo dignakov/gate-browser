@@ -1,8 +1,8 @@
-//! Settings › Look: the background (solid, gradient, wallpaper), how see-
-//! through the sidebar is, and the glass's blur.
+//! Settings › Look: light or dark, the background (solid, gradient,
+//! wallpaper), how see-through the sidebar is, and the glass's blur.
 
-use crate::backdrop::{self, Background, PRESETS, SWATCHES};
-use crate::settings::Settings;
+use crate::backdrop::{self, Background, DARK_SWATCHES, LIGHT_SWATCHES, PRESETS};
+use crate::settings::{Settings, Theme};
 use crate::settings_view::{heading, row, toggle};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme;
@@ -98,10 +98,6 @@ pub fn wallpaper_dir(s: &Settings) -> PathBuf {
 fn field(placeholder: &str, text: String, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TextInput> {
     cx.new(|cx| {
         let mut input = TextInput::new(placeholder.to_string(), window, cx);
-        input.text_color = theme::text().into();
-        input.placeholder_color = theme::text_dim().into();
-        input.selection_color = theme::accent_soft().into();
-        input.cursor_color = theme::accent().into();
         input.set_text(text, cx);
         input
     })
@@ -258,6 +254,8 @@ impl Workspace {
                             .size(px(2.0 * KNOB_R))
                             .rounded_full()
                             .bg(gpui::white())
+                            .border_1()
+                            .border_color(theme::border())
                             .shadow_sm(),
                     )
                     .on_mouse_down(
@@ -283,54 +281,67 @@ impl Workspace {
         let dir = wallpaper_dir(&settings);
         let walls = backdrop::wallpapers(&dir);
 
-        // Solid / Gradient / Wallpaper.
-        let segments = div().flex().p(px(2.)).gap(px(2.)).rounded(px(8.)).bg(theme::wash(0.05)).children(
-            ["Solid", "Gradient", "Wallpaper"].into_iter().enumerate().map(|(i, label)| {
-                let first_wall = walls.first().cloned();
-                div()
-                    .id(SharedString::from(format!("bg-kind-{label}")))
-                    .px(px(12.))
-                    .py(px(4.))
-                    .rounded(px(6.))
-                    .text_size(px(12.5))
-                    .when(i == kind, |d| d.bg(theme::selected()).text_color(theme::text()))
-                    .when(i != kind, |d| d.text_color(theme::text_muted()).hover(|d| d.text_color(theme::text())))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let background = match i {
-                            0 => Background::default(),
-                            1 => Background::Gradient { colors: PRESETS[0].colors.to_vec(), angle: PRESETS[0].angle },
-                            _ => match first_wall.clone() {
-                                Some(path) => Background::Wallpaper { path },
-                                None => return,
-                            },
-                        };
-                        if i != kind {
-                            this.set_background(background, cx);
-                        }
-                    }))
-            }),
+        let themes = segments(
+            "theme",
+            &["System", "Light", "Dark"],
+            match settings.theme {
+                Theme::System => 0,
+                Theme::Light => 1,
+                Theme::Dark => 2,
+            },
+            cx,
+            |this, i, window, cx| {
+                let theme = [Theme::System, Theme::Light, Theme::Dark][i];
+                this.store.set(|s| s.theme = theme);
+                this.apply_theme(window, cx);
+                cx.notify();
+            },
         );
 
-        let mut page = div().flex().flex_col().child(heading("Look")).child(row(
-            "Background",
-            Some("Behind the sidebar and between the panes.".to_string()),
-            false,
-            segments.into_any_element(),
-        ));
+        let first_wall = walls.first().cloned();
+        let kinds = segments("bg-kind", &["Solid", "Gradient", "Wallpaper"], kind, cx, move |this, i, _, cx| {
+            let background = match i {
+                0 => Background::default(),
+                1 => Background::Gradient { colors: PRESETS[0].colors.to_vec(), angle: PRESETS[0].angle },
+                _ => match first_wall.clone() {
+                    Some(path) => Background::Wallpaper { path },
+                    None => return,
+                },
+            };
+            if i != kind {
+                this.set_background(background, cx);
+            }
+        });
+
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .child(heading("Look"))
+            .child(row("Theme", Some("Gate's colors, and the color scheme pages ask for.".to_string()), false, themes))
+            .child(row("Background", Some("Behind the sidebar and between the panes.".to_string()), false, kinds));
 
         match &settings.background {
-            Background::Solid { color } => {
-                let current = *color;
-                page = page.child(div().flex().flex_wrap().gap(px(10.)).py(px(12.)).children(SWATCHES.iter().map(|&c| {
+            Background::Solid { dark, light } => {
+                // The theme in use's colors: each theme keeps its own.
+                let current = settings.background.solid();
+                let (dark, light) = (*dark, *light);
+                let swatches = if theme::dark() { DARK_SWATCHES } else { LIGHT_SWATCHES };
+                page = page.child(div().flex().flex_wrap().gap(px(10.)).py(px(12.)).children(swatches.iter().map(|&c| {
                     div()
                         .id(SharedString::from(format!("swatch-{c:06x}")))
                         .size(px(28.))
                         .rounded_full()
                         .bg(gpui::rgb(c))
                         .border_2()
-                        .border_color(if c == current { theme::accent().into() } else { theme::border() })
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_background(Background::Solid { color: c }, cx)))
+                        .border_color(if Some(c) == current { theme::accent().into() } else { theme::border() })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let background = if theme::dark() {
+                                Background::Solid { dark: Some(c), light }
+                            } else {
+                                Background::Solid { dark, light: Some(c) }
+                            };
+                            this.set_background(background, cx)
+                        }))
                 })));
             }
             Background::Gradient { colors, .. } => {
@@ -455,6 +466,37 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, _, cx| pick(this, cx)))
             .into_any_element()
     }
+}
+
+/// A row of choices, one of them on (`on`); `pick` gets the one clicked.
+fn segments(
+    id: &str,
+    labels: &[&'static str],
+    on: usize,
+    cx: &mut Context<Workspace>,
+    pick: impl Fn(&mut Workspace, usize, &mut Window, &mut Context<Workspace>) + 'static,
+) -> AnyElement {
+    let pick = Rc::new(pick);
+    div()
+        .flex()
+        .p(px(2.))
+        .gap(px(2.))
+        .rounded(px(8.))
+        .bg(theme::wash(0.05))
+        .children(labels.iter().enumerate().map(|(i, &label)| {
+            let pick = pick.clone();
+            div()
+                .id(SharedString::from(format!("{id}-{label}")))
+                .px(px(12.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .text_size(px(12.5))
+                .when(i == on, |d| d.bg(theme::selected()).text_color(theme::text()))
+                .when(i != on, |d| d.text_color(theme::text_muted()).hover(|d| d.text_color(theme::text())))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| pick(this, i, window, cx)))
+        }))
+        .into_any_element()
 }
 
 fn hex_field(input: Entity<TextInput>) -> impl IntoElement {

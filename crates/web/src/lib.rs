@@ -100,6 +100,16 @@ pub fn on_relaunch(handler: impl Fn(Vec<String>, &mut gpui::App) + 'static) {
     }
 }
 
+/// Pages prefer a dark color scheme (`prefers-color-scheme: dark`), or a
+/// light one. Before the first page or after: later pages follow it too.
+pub fn set_dark_mode(dark: bool) {
+    match engine::engine() {
+        engine::Engine::Cef => engine::cef::set_dark_mode(dark),
+        #[cfg(gate_wpe)]
+        engine::Engine::Wpe => engine::wpe::set_dark_mode(dark),
+    }
+}
+
 /// Shuts the engine down. Every [`WebView`] must have been closed.
 pub fn shutdown() {
     match engine::engine() {
