@@ -14,6 +14,7 @@ mod glib;
 #[cfg(target_os = "linux")]
 mod gpu_frames;
 mod keys;
+mod pacing;
 mod pump;
 mod renderer;
 
@@ -165,6 +166,8 @@ impl CefPage {
         let window_info = WindowInfo {
             windowless_rendering_enabled: 1,
             shared_texture_enabled: self.takes_gpu_frames() as i32,
+            // Gate paces frames (see `pacing`).
+            external_begin_frame_enabled: 1,
             runtime_style: RuntimeStyle::ALLOY,
             ..Default::default()
         };
@@ -310,11 +313,25 @@ impl Page for CefPage {
                 let (button, flag) = cef_button(button);
                 let event = self.mouse_event(at, &modifiers);
                 self.buttons &= !flag;
+                // Releasing the button drops what's dragged and ends the drag.
+                let drag = if button == MouseButtonType::LEFT { self.shared.borrow_mut().drag.take() } else { None };
+                if let Some(drag) = drag {
+                    self.with_host(|h| {
+                        h.drag_target_drop(Some(&event));
+                        h.drag_source_ended_at(event.x, event.y, drag.operation);
+                        h.drag_source_system_drag_ended();
+                    });
+                    return;
+                }
                 self.with_host(|h| h.send_mouse_click_event(Some(&event), button, 1, clicks.clamp(1, 3) as i32));
             }
             Input::MouseMove { at, modifiers } => {
                 let event = self.mouse_event(at, &modifiers);
-                self.with_host(|h| h.send_mouse_move_event(Some(&event), 0));
+                let dragging = self.shared.borrow().drag.as_ref().map(|d| d.allowed);
+                match dragging {
+                    Some(allowed) => self.with_host(|h| h.drag_target_drag_over(Some(&event), allowed)),
+                    None => self.with_host(|h| h.send_mouse_move_event(Some(&event), 0)),
+                }
             }
             Input::MouseLeave => {
                 let event = MouseEvent { x: -1, y: -1, modifiers: 0 };
@@ -441,6 +458,14 @@ impl Page for CefPage {
     }
 
     fn paint(&mut self, bounds: Bounds<Pixels>, corners: Corners<Pixels>, window: &mut Window) {
+        {
+            let mut shared = self.shared.borrow_mut();
+            if !shared.pacing.ticking && !shared.hidden {
+                shared.pacing.ticking = true;
+                drop(shared);
+                pace(Rc::downgrade(&self.shared), window);
+            }
+        }
         let scale = window.scale_factor();
         let shared = self.shared.borrow();
         let mut lost = false;
@@ -469,6 +494,31 @@ impl Drop for CefPage {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Follows `window`'s display refreshes while the page is shown, sending
+/// begin frames as [`pacing::Pacing`] decides.
+fn pace(shared: std::rc::Weak<RefCell<Shared>>, window: &mut Window) {
+    window.on_next_display_frame(move |window, _| {
+        let Some(page) = shared.upgrade() else { return };
+        let host = {
+            let mut page = page.borrow_mut();
+            if page.hidden {
+                page.pacing.stop();
+                return;
+            }
+            // No browser yet: nothing to pace.
+            match page.browser.as_ref().and_then(|b| b.host()) {
+                Some(host) if page.pacing.refresh(std::time::Instant::now()) => Some(host),
+                _ => None,
+            }
+        };
+        // Outside the borrow: CEF may paint from within.
+        if let Some(host) = host {
+            host.send_external_begin_frame();
+        }
+        pace(shared, window);
+    });
 }
 
 /// Paints a surface's atlas tile at `origin`; false when the atlas lost the

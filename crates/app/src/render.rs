@@ -107,7 +107,7 @@ impl Render for Workspace {
             .when(floating, |s| s.border_1().rounded(px(theme::PANE_RADIUS)))
             .when(!floating, |s| s.border_r_1())
             .child(if self.sidebar.collapsed {
-                self.rail(cx).into_any_element()
+                self.rail(vh - 2.0 * inset, cx).into_any_element()
             } else {
                 self.sidebar(vh - 2.0 * inset, cx).into_any_element()
             });
@@ -119,7 +119,9 @@ impl Render for Workspace {
             .rounded(px(radius))
             .bg(canvas)
             .overflow_hidden()
-            .when_some(sharp, |f, image| f.child(img(image).absolute().inset_0().object_fit(ObjectFit::Fill)))
+            // Sized outright: an image's own size is its device pixels, which
+            // would win over insets (and overflow at scales above 1).
+            .when_some(sharp, |f, image| f.child(img(image).absolute().left_0().top_0().w(px(vw)).h(px(vh)).object_fit(ObjectFit::Fill)))
             .child(sidebar)
             .children(self.render_panes(area, cx));
 
@@ -262,12 +264,11 @@ impl Workspace {
 
         // Spaces takes its share of the lists; Activity the rest.
         let lists = vh - theme::HEADER_HEIGHT - theme::ADDRESS_BLOCK - theme::FOOTER_HEIGHT;
-        let spaces_height = (self.sidebar.split * lists).clamp(theme::LIST_MIN, (lists - theme::LIST_MIN).max(theme::LIST_MIN));
         let spaces = div()
             .flex()
             .flex_col()
             .flex_none()
-            .h(px(spaces_height))
+            .h(px(self.spaces_height(lists)))
             .child(section_header(
                 "Spaces",
                 Some(
@@ -310,25 +311,7 @@ impl Workspace {
                     .px(px(8.))
                     .children(self.activity_rows(cx)),
             )
-            // The line above is a handle: drag it to share the height.
-            .child(
-                div()
-                    .id("lists-split")
-                    .absolute()
-                    .top(px(-4.))
-                    .left_0()
-                    .right_0()
-                    .h(px(7.))
-                    .cursor_row_resize()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.sidebar.drag = Some(SidebarDrag::Split { last: f32::from(ev.position.y), lists });
-                            cx.notify();
-                        }),
-                    ),
-            );
+            .child(self.lists_split(lists, cx));
 
         // At the bottom, as herdr has it.
         let footer = div()
@@ -537,11 +520,35 @@ impl Workspace {
         rows
     }
 
+    /// The line between Spaces and Activity (in the sidebar and the rail) is a
+    /// handle: drag it to share their height, `lists`, between them.
+    fn lists_split(&mut self, lists: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("lists-split")
+            .absolute()
+            .top(px(-4.))
+            .left_0()
+            .right_0()
+            .h(px(7.))
+            .cursor_row_resize()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.sidebar.drag = Some(SidebarDrag::Split { last: f32::from(ev.position.y), lists });
+                    cx.notify();
+                }),
+            )
+    }
+
     // ---- the rail (collapsed sidebar)
 
-    fn rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn rail(&mut self, vh: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = self.ink;
-        let top = chrome::window_drag(div().id("rail-top").flex().flex_col().flex_none().items_center().pt(px(14.)).pb(px(8.)).gap(px(8.)))
+        let top = chrome::window_drag(
+            div().id("rail-top").flex().flex_col().flex_none().h(px(theme::RAIL_HEADER_HEIGHT)).items_center().pt(px(14.)).pb(px(8.)).gap(px(8.)),
+        )
             .child(chrome::traffic_lights(true))
             .child(icon_button("rail-expand", "icons/panel-left.svg", ink).on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))));
 
@@ -556,6 +563,7 @@ impl Workspace {
             );
         }
 
+        let lists = vh - theme::RAIL_HEADER_HEIGHT - theme::FOOTER_HEIGHT;
         let mut activity = Vec::new();
         if self.store.ublock_update.ready.is_some() {
             activity.push(
@@ -587,8 +595,8 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .flex_1()
-                    .min_h_0()
+                    .flex_none()
+                    .h(px(self.spaces_height(lists)))
                     .overflow_y_scroll()
                     .gap(px(2.))
                     .child(
@@ -614,22 +622,30 @@ impl Workspace {
             )
             .child(
                 div()
-                    .id("rail-activity")
+                    .relative()
                     .flex()
                     .flex_col()
-                    .items_center()
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .pt(px(6.))
-                    .overflow_y_scroll()
-                    .gap(px(2.))
                     .border_t_1()
                     .border_color(theme::border())
-                    .children(activity),
+                    .child(
+                        div()
+                            .id("rail-activity")
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .size_full()
+                            .pt(px(6.))
+                            .overflow_y_scroll()
+                            .gap(px(2.))
+                            .children(activity),
+                    )
+                    .child(self.lists_split(lists, cx)),
             )
             .child(
-                div().flex_none().w_full().flex().justify_center().pt(px(4.)).pb(px(8.)).border_t_1().border_color(theme::border()).child(
+                div().flex_none().h(px(theme::FOOTER_HEIGHT)).w_full().flex().justify_center().pt(px(4.)).pb(px(8.)).border_t_1().border_color(theme::border()).child(
                     icon_button("rail-settings", "icons/settings.svg", ink)
                         .on_click(cx.listener(|this, _, w, cx| this.on_open_settings(&crate::workspace::OpenSettings, w, cx))),
                 ),
@@ -647,6 +663,9 @@ impl Workspace {
             .left(px(side - 3.0))
             .w(px(6.))
             .cursor_col_resize()
+            // Over the header's drag area (see `chrome::window_drag`), the
+            // handle, not the title bar, takes the press.
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {

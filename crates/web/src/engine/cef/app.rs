@@ -41,6 +41,7 @@ wrap_app! {
             // append_switch becomes a switch literally named that.
             command_line.append_switch_with_value(Some(&"password-store".into()), Some(&"basic".into()));
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
+
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {

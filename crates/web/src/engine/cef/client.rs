@@ -63,6 +63,19 @@ pub(crate) struct Shared {
     /// Frames with media, by frame identifier, and what it's doing.
     pub media: HashMap<String, Playback>,
     pub events: Events,
+    /// The page's frames, paced by display refreshes.
+    pub pacing: super::pacing::Pacing,
+    /// A drag the page started (HTML drag and drop), until the button is
+    /// released.
+    pub drag: Option<Drag>,
+}
+
+/// A drag within the page: Chromium is both its source and its target.
+pub(crate) struct Drag {
+    /// What the source allows.
+    pub allowed: DragOperationsMask,
+    /// What the target under the pointer would do with a drop.
+    pub operation: DragOperationsMask,
 }
 
 impl Shared {
@@ -86,6 +99,8 @@ impl Shared {
             favicon_url: None,
             media: HashMap::new(),
             events,
+            pacing: Default::default(),
+            drag: None,
         }
     }
 
@@ -197,6 +212,7 @@ wrap_render_handler! {
             {
                 let mut shared = self.shared.borrow_mut();
                 let shared = &mut *shared;
+                shared.pacing.painted(std::time::Instant::now());
                 let (Some(gpu), Some(frames), Some(info)) = (shared.gpu.as_mut(), shared.frames.as_ref(), info) else { return };
                 let surface = if type_ == PaintElementType::POPUP { &mut shared.popup } else { &mut shared.page };
                 if gpu.take(frames, surface, info, dirty_rects.unwrap_or(&[])) {
@@ -210,6 +226,32 @@ wrap_render_handler! {
             let _ = (type_, dirty_rects, info);
         }
 
+        /// A drag (HTML drag and drop) begins. Gate has no drags of its own
+        /// between apps yet, so it plays the system's part within the page:
+        /// the page is the drop target too, fed by the pointer (see
+        /// `CefPage::input`) until the button is released.
+        fn start_dragging(
+            &self,
+            browser: Option<&mut Browser>,
+            drag_data: Option<&mut DragData>,
+            allowed_ops: DragOperationsMask,
+            x: ::std::os::raw::c_int,
+            y: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            let (Some(host), Some(drag_data)) = (browser.and_then(|b| b.host()), drag_data) else { return 0 };
+            self.shared.borrow_mut().drag = Some(Drag { allowed: allowed_ops, operation: DragOperationsMask::default() });
+            let event = MouseEvent { x, y, modifiers: super::keys::LEFT_BUTTON };
+            host.drag_target_drag_enter(Some(drag_data), Some(&event), allowed_ops);
+            host.drag_target_drag_over(Some(&event), allowed_ops);
+            1
+        }
+
+        fn update_drag_cursor(&self, _browser: Option<&mut Browser>, operation: DragOperationsMask) {
+            if let Some(drag) = self.shared.borrow_mut().drag.as_mut() {
+                drag.operation = operation;
+            }
+        }
+
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,
@@ -221,6 +263,7 @@ wrap_render_handler! {
         ) {
             let mut shared = self.shared.borrow_mut();
             let shared = &mut *shared;
+            shared.pacing.painted(std::time::Instant::now());
             let Some(frames) = shared.frames.as_ref() else { return };
             let surface = if type_ == PaintElementType::POPUP { &mut shared.popup } else { &mut shared.page };
             // Uploaded now, straight from CEF's buffer (valid for this call).

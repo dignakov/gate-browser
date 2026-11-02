@@ -788,6 +788,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Spaces' share of `lists`, the height Spaces and Activity divide.
+    pub fn spaces_height(&self, lists: f32) -> f32 {
+        (self.sidebar.split * lists).clamp(theme::LIST_MIN, (lists - theme::LIST_MIN).max(theme::LIST_MIN))
+    }
+
     /// Moves the line between Spaces and Activity by `delta` pixels.
     pub fn drag_sidebar_split(&mut self, delta: f32, lists: f32, cx: &mut Context<Self>) {
         if lists <= 2.0 * theme::LIST_MIN {

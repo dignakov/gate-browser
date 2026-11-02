@@ -154,6 +154,8 @@ pub const SIDEBAR_COLLAPSE: f32 = 140.0;
 pub const SIDEBAR_MAX: f32 = 480.0;
 /// The collapsed sidebar: a rail of tiles.
 pub const RAIL_WIDTH: f32 = 44.0;
+/// The rail's top: the window controls stacked, and the expand button.
+pub const RAIL_HEADER_HEIGHT: f32 = 110.0;
 /// The sidebar's top row (window controls and navigation).
 pub const HEADER_HEIGHT: f32 = 46.0;
 /// The address field and the space below it.
