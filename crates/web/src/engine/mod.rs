@@ -4,6 +4,8 @@
 //! also works from an engine's own threads).
 
 pub(crate) mod cef;
+#[cfg(gate_wpe)]
+pub(crate) mod wpe;
 
 use crate::{Ask, Playback, Zoom};
 use gpui::{Bounds, Corners, CursorStyle, Keystroke, Modifiers, Pixels, Point, RenderImage, ScrollDelta, Window};
@@ -26,6 +28,14 @@ pub(crate) enum PageEvent {
     Playback(Playback),
     Crashed,
     Cursor(CursorStyle),
+    /// The page copied text (engines that don't reach the clipboard
+    /// themselves).
+    #[cfg_attr(not(gate_wpe), allow(dead_code))]
+    Clipboard(String),
+    /// A select's options to choose from, or none (engines that don't draw
+    /// these menus themselves); answered with [`Page::choose`].
+    #[cfg_attr(not(gate_wpe), allow(dead_code))]
+    Menu(Option<Menu>),
     /// New pixels to paint.
     Repaint,
     /// The engine wants a turn with the page on the main thread
@@ -37,6 +47,25 @@ pub(crate) enum PageEvent {
 }
 
 pub(crate) type Events = async_channel::Sender<PageEvent>;
+
+/// A select's menu: its options, below the select at `at` (page coordinates).
+#[derive(Clone, Debug)]
+#[cfg_attr(not(gate_wpe), allow(dead_code))]
+pub(crate) struct Menu {
+    pub at: Point<f32>,
+    pub width: f32,
+    pub items: Vec<MenuItem>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(not(gate_wpe), allow(dead_code))]
+pub(crate) struct MenuItem {
+    pub label: String,
+    pub enabled: bool,
+    pub selected: bool,
+    /// A heading over the options after it.
+    pub group: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Button {
@@ -70,6 +99,11 @@ pub(crate) trait Page {
     /// scale; called every frame it is shown.
     fn layout(&mut self, bounds: Bounds<Pixels>, scale: f32);
     fn input(&mut self, input: Input<'_>);
+    /// The clipboard's text, before input that may paste it (engines that
+    /// don't read the clipboard themselves).
+    fn share_clipboard(&mut self, _text: Option<String>) {}
+    /// Chooses an option of the page's [`Menu`], or none (it closes).
+    fn choose(&mut self, _index: Option<usize>) {}
     fn zoom(&mut self, zoom: Zoom);
     /// The page's zoom in percent (100: none).
     fn zoom_percent(&self) -> u32;
@@ -88,7 +122,32 @@ pub(crate) trait Page {
     fn pump(&mut self) {}
 }
 
-/// A page for `url` in this platform's engine.
+/// The engines Gate can run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Engine {
+    Cef,
+    #[cfg(gate_wpe)]
+    Wpe,
+}
+
+/// This run's engine: WPE WebKit on Linux when built with it, unless
+/// `GATE_ENGINE=cef`; Chromium elsewhere.
+pub(crate) fn engine() -> Engine {
+    static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+    *ENGINE.get_or_init(|| {
+        #[cfg(gate_wpe)]
+        if std::env::var("GATE_ENGINE").as_deref() != Ok("cef") {
+            return Engine::Wpe;
+        }
+        Engine::Cef
+    })
+}
+
+/// A page for `url` in this run's engine.
 pub(crate) fn new_page(url: &str, events: Events, window: &mut Window) -> Box<dyn Page> {
-    Box::new(cef::CefPage::new(url, events, window))
+    match engine() {
+        Engine::Cef => Box::new(cef::CefPage::new(url, events, window)),
+        #[cfg(gate_wpe)]
+        Engine::Wpe => Box::new(wpe::WpePage::new(url, events, window)),
+    }
 }

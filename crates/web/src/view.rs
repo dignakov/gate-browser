@@ -1,13 +1,13 @@
 //! [`WebView`]: one page as a GPUI view, on whichever engine renders it. It
 //! keeps what the page reported, forwards input, and has the engine paint.
 
-use crate::engine::{self, Button, Input, Page, PageEvent};
+use crate::engine::{self, Button, Input, Menu, Page, PageEvent};
 use crate::{Ask, Playback, Zoom};
 use gpui::{
     App, Bounds, Context, Corners, CursorStyle, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement as _, Pixels, Point, Render, RenderImage, ScrollWheelEvent, StatefulInteractiveElement as _,
-    Styled as _, Window, canvas, div, point,
+    Styled as _, Window, anchored, canvas, deferred, div, point, px, rgb, prelude::FluentBuilder as _,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -63,6 +63,8 @@ pub struct WebView {
     crashed: bool,
     playback: Playback,
     muted: bool,
+    /// A select's options, open over the page.
+    menu: Option<Menu>,
     /// Rounds the page's corners (where the pane's card is rounded).
     corners: Corners<Pixels>,
     closed: bool,
@@ -156,6 +158,7 @@ impl WebView {
             crashed: false,
             playback: Playback::None,
             muted: false,
+            menu: None,
             corners: Corners::default(),
             closed: false,
         }
@@ -307,6 +310,14 @@ impl WebView {
                     self.cursor = cursor;
                     None
                 }
+                PageEvent::Menu(menu) => {
+                    self.menu = menu;
+                    None
+                }
+                PageEvent::Clipboard(text) => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    None
+                }
                 PageEvent::Url(url) => {
                     self.url = url.clone();
                     Some(WebEvent::Url(url))
@@ -366,8 +377,17 @@ impl WebView {
         point(f32::from(position.x - origin.x), f32::from(position.y - origin.y))
     }
 
+    /// Closes the select menu, choosing `index` or nothing.
+    fn choose(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            self.with_page(|p| p.choose(index));
+            cx.notify();
+        }
+    }
+
     fn mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+        self.choose(None, cx);
         let Some(button) = button(ev.button) else {
             // Back/forward mouse buttons navigate.
             if let MouseButton::Navigate(dir) = ev.button {
@@ -416,6 +436,15 @@ impl WebView {
     }
 
     fn key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() && ev.keystroke.key == "escape" {
+            self.choose(None, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if pastes(&ev.keystroke) {
+            let text = cx.read_from_clipboard().and_then(|item| item.text());
+            self.with_page(|p| p.share_clipboard(text));
+        }
         self.with_page(|p| p.input(Input::KeyDown { keystroke: &ev.keystroke, repeat: ev.is_held }));
         cx.stop_propagation();
     }
@@ -424,6 +453,12 @@ impl WebView {
         self.with_page(|p| p.input(Input::KeyUp { keystroke: &ev.keystroke }));
         cx.stop_propagation();
     }
+}
+
+/// Whether a keystroke pastes: Ctrl+V, Ctrl+Shift+V, Shift+Insert.
+fn pastes(k: &gpui::Keystroke) -> bool {
+    let m = &k.modifiers;
+    (k.key == "v" && (m.control || m.platform) && !m.alt) || (k.key == "insert" && m.shift)
 }
 
 fn button(b: MouseButton) -> Option<Button> {
@@ -443,6 +478,7 @@ impl Drop for WebView {
 
 impl Render for WebView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = self.menu.clone().map(|menu| self.render_menu(menu, cx));
         let layout_view = cx.entity();
         let paint_view = cx.entity();
         let bounds_cell = self.bounds.clone();
@@ -493,5 +529,52 @@ impl Render for WebView {
                 )
                 .size_full(),
             )
+            .children(menu)
+    }
+}
+
+impl WebView {
+    /// A select's options, below it, like the platform's own menus.
+    fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let origin = self.bounds.get().origin + point(px(menu.at.x), px(menu.at.y));
+        let items = menu.items.into_iter().enumerate().map(|(index, item)| {
+            let row = div()
+                .id(("option", index))
+                .px_2()
+                .py(px(3.))
+                .text_size(px(13.))
+                .text_color(if item.enabled || item.group { rgb(0x1d1d1f) } else { rgb(0x9a9aa0) })
+                .when(item.group, |d| d.font_weight(gpui::FontWeight::SEMIBOLD))
+                .when(item.selected, |d| d.bg(rgb(0xe3e8f4)))
+                .child(item.label);
+            if item.enabled {
+                row.hover(|d| d.bg(rgb(0x2f6fed)).text_color(rgb(0xffffff)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        this.choose(Some(index), cx);
+                        cx.stop_propagation();
+                    }))
+            } else {
+                row
+            }
+        }).collect::<Vec<_>>();
+        deferred(
+            anchored().position(origin).snap_to_window_with_margin(px(8.)).child(
+                div()
+                    .id("select-menu")
+                    .min_w(px(menu.width.max(120.)))
+                    .max_h(px(420.))
+                    .overflow_y_scroll()
+                    .py_1()
+                    .bg(rgb(0xffffff))
+                    .border_1()
+                    .border_color(rgb(0xd0d0d6))
+                    .rounded(px(6.))
+                    .shadow_lg()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.choose(None, cx)))
+                    .children(items),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 }

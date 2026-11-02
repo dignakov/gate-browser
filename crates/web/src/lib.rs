@@ -54,7 +54,11 @@ pub enum Started {
 /// launched it as one. Call first thing in `main`, before anything else
 /// starts threads: `Some(code)` means exit with `code`.
 pub fn run_helper_process() -> Option<i32> {
-    engine::cef::run_helper_process()
+    match engine::engine() {
+        engine::Engine::Cef => engine::cef::run_helper_process(),
+        #[cfg(gate_wpe)]
+        engine::Engine::Wpe => None,
+    }
 }
 
 /// Starts the engine and begins pumping its work from GPUI.
@@ -63,7 +67,20 @@ pub fn run_helper_process() -> Option<i32> {
 /// `gpu_frames`: pages hand frames over as GPU buffers where the platform
 /// can; otherwise as pixels through the CPU.
 pub fn init(profile: &Path, extensions: &[PathBuf], gpu_frames: bool, cx: &mut gpui::App) -> Result<Started> {
-    engine::cef::init(profile, extensions, gpu_frames, cx)
+    match engine::engine() {
+        engine::Engine::Cef => engine::cef::init(profile, extensions, gpu_frames, cx),
+        #[cfg(gate_wpe)]
+        engine::Engine::Wpe => engine::wpe::init(profile, cx),
+    }
+}
+
+/// The engine pages run on, in words ("Chromium", "WebKit").
+pub fn engine_name() -> &'static str {
+    match engine::engine() {
+        engine::Engine::Cef => "Chromium",
+        #[cfg(gate_wpe)]
+        engine::Engine::Wpe => "WebKit",
+    }
 }
 
 /// The id Chromium gives the unpacked extension in `dir` (its pages live at
@@ -76,10 +93,18 @@ pub fn extension_id(dir: &Path) -> String {
 /// Calls `handler` with the arguments (not switches) of every later launch
 /// on the same profile, which hands them here and exits.
 pub fn on_relaunch(handler: impl Fn(Vec<String>, &mut gpui::App) + 'static) {
-    engine::cef::on_relaunch(handler)
+    match engine::engine() {
+        engine::Engine::Cef => engine::cef::on_relaunch(handler),
+        #[cfg(gate_wpe)]
+        engine::Engine::Wpe => engine::wpe::on_relaunch(handler),
+    }
 }
 
 /// Shuts the engine down. Every [`WebView`] must have been closed.
 pub fn shutdown() {
-    engine::cef::shutdown()
+    match engine::engine() {
+        engine::Engine::Cef => engine::cef::shutdown(),
+        #[cfg(gate_wpe)]
+        engine::Engine::Wpe => engine::wpe::shutdown(),
+    }
 }

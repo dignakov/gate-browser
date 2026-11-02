@@ -6580,6 +6580,7 @@ dependencies = [
  "gpui",
  "image",
  "libc",
+ "serde_json",
  "sha2",
  "tracing",
 ]

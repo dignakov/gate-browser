@@ -170,9 +170,14 @@ fn build_wpe() -> Result<()> {
         .arg(&build)
         .args(["-G", "Ninja", "-DPORT=WPE", "-DCMAKE_BUILD_TYPE=Release", "-DENABLE_WPE_PLATFORM=ON", "-DENABLE_WPE_PLATFORM_HEADLESS=ON"])
         .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install.display()))
+        // Its processes (libexec/wpe-webkit-2.0) and libraries find each
+        // other wherever the install goes.
+        .arg("-DCMAKE_INSTALL_RPATH=$ORIGIN/../../lib;$ORIGIN/../lib;$ORIGIN")
         .args(off.iter().map(|o| format!("-D{o}=OFF")));
     run(&mut configure).context("configuring WPE WebKit (missing -dev packages show above)")?;
-    run(Command::new("cmake").arg("--build").arg(&build)).context("building WPE WebKit")?;
+    // WebKit builds for an hour or two; GATE_JOBS caps the parallelism.
+    let jobs = std::env::var("GATE_JOBS").unwrap_or_else(|_| "4".into());
+    run(Command::new("cmake").arg("--build").arg(&build).args(["-j", &jobs])).context("building WPE WebKit")?;
     run(Command::new("cmake").arg("--install").arg(&build)).context("installing WPE WebKit")?;
     println!("{}", install.display());
     Ok(())
