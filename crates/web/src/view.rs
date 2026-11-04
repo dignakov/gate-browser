@@ -35,6 +35,9 @@ pub enum WebEvent {
     Playback(Playback),
     /// The page's renderer died.
     Crashed,
+    /// One of Gate's shortcuts, pressed while the page held the keyboard:
+    /// dispatch it (see [`crate::set_app_shortcuts`]).
+    Key(gpui::Keystroke),
     Closed,
 }
 
@@ -53,6 +56,8 @@ pub struct WebView {
     title: String,
     favicon: Option<Arc<RenderImage>>,
     cursor: CursorStyle,
+    /// The page's own cursor, shown instead of `cursor` where it can be.
+    native_cursor: Option<gpui::NativeCursor>,
     loading: bool,
     can_go_back: bool,
     can_go_forward: bool,
@@ -148,6 +153,7 @@ impl WebView {
             title: String::new(),
             favicon: None,
             cursor: CursorStyle::Arrow,
+            native_cursor: None,
             loading: true,
             can_go_back: false,
             can_go_forward: false,
@@ -308,6 +314,14 @@ impl WebView {
                 }
                 PageEvent::Cursor(cursor) => {
                     self.cursor = cursor;
+                    self.native_cursor = None;
+                    cx.notify();
+                    None
+                }
+                PageEvent::NativeCursor { cursor, fallback } => {
+                    self.cursor = fallback;
+                    self.native_cursor = Some(cursor);
+                    cx.notify();
                     None
                 }
                 PageEvent::Menu(menu) => {
@@ -362,6 +376,7 @@ impl WebView {
                     self.crashed = true;
                     Some(WebEvent::Crashed)
                 }
+                PageEvent::Key(keystroke) => Some(WebEvent::Key(keystroke)),
                 PageEvent::Closed => Some(WebEvent::Closed),
             };
             if let Some(event) = out {
@@ -518,9 +533,13 @@ impl Render for WebView {
                                 view.wake(window);
                             }
                             view.with_page(|p| p.layout(bounds, scale));
-                        });
+                            view.native_cursor.map(|native| (window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal), native, view.cursor))
+                        })
                     },
-                    move |bounds, _, window, cx| {
+                    move |bounds, cursor, window, cx| {
+                        if let Some((hitbox, native, fallback)) = cursor {
+                            window.set_native_cursor(native, fallback, &hitbox);
+                        }
                         paint_view.update(cx, |view, _| {
                             let corners = view.corners;
                             view.with_page(|p| p.paint(bounds, corners, window));

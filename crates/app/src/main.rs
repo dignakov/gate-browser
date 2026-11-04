@@ -40,15 +40,11 @@ fn main() {
     if let Some(code) = web::run_helper_process() {
         std::process::exit(code);
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("GATE_LOG").unwrap_or_else(|_| "warn,gate=info,web=info".into()),
-        )
-        .init();
+    let profile = profile_dir();
+    start_logging(&profile);
     // Anything not a flag is a page to open.
     let urls: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with("--")).map(|a| url::resolve(&a)).collect();
 
-    let profile = profile_dir();
     let settings = settings::Settings::load(&profile.join("settings.json"));
     // Before Chromium starts: a downloaded update goes in now.
     let paths = ublock::Paths::new(&profile);
@@ -74,7 +70,7 @@ fn main() {
             // The running instance opens our pages.
             Ok(web::Started::Elsewhere) => return cx.quit(),
             Err(error) => {
-                eprintln!("gate: {error:#}");
+                tracing::error!("{error:#}");
                 // A non-zero status; the quit hook does not run without CEF.
                 std::process::exit(1);
             }
@@ -82,11 +78,12 @@ fn main() {
         assets::load_fonts(cx);
         text_input::bind_keys(cx);
         workspace::bind_keys(cx);
+        web::set_app_shortcuts(workspace_shortcuts(cx));
 
         let db = match db::Db::open(&profile.join("gate.db")) {
             Ok(db) => db,
             Err(error) => {
-                eprintln!("gate: opening the database: {error}");
+                tracing::error!("opening the database: {error}");
                 std::process::exit(1);
             }
         };
@@ -115,7 +112,7 @@ fn main() {
         let window = match window {
             Ok(window) => window,
             Err(error) => {
-                eprintln!("gate: opening the window: {error:#}");
+                tracing::error!("opening the window: {error:#}");
                 return cx.quit();
             }
         };
@@ -142,10 +139,10 @@ fn main() {
                     match std::env::current_exe() {
                         Ok(exe) => {
                             if let Err(error) = std::process::Command::new(exe).spawn() {
-                                eprintln!("gate: restarting: {error}");
+                                tracing::error!("restarting: {error}");
                             }
                         }
-                        Err(error) => eprintln!("gate: restarting: {error}"),
+                        Err(error) => tracing::error!("restarting: {error}"),
                     }
                 }
             }
@@ -153,6 +150,60 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+/// Logs to stderr, and on Windows (where Gate has no console) to `gate.log`
+/// in the profile, appended to, each run starting with a header line. Panics
+/// are logged too. `GATE_LOG` filters (e.g. `GATE_LOG=debug`).
+fn start_logging(profile: &std::path::Path) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("GATE_LOG").unwrap_or_else(|_| "warn,gate=info,web=info".into());
+    let level = filter.to_string();
+    #[cfg(windows)]
+    let file = {
+        let _ = std::fs::create_dir_all(profile);
+        let path = profile.join("gate.log");
+        // A long-lived log starts over rather than grow without end.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
+    };
+    #[cfg(not(windows))]
+    let file: Option<std::fs::File> = {
+        let _ = profile;
+        None
+    };
+    match file {
+        Some(file) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
+    tracing::info!(
+        "Gate {} ({} {}), pid {}, engine {}, log {level}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::process::id(),
+        web::engine_name()
+    );
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
+        default_hook(info);
+    }));
+}
+
+/// Gate's shortcuts (single keystrokes bound in the Workspace context), for
+/// engines whose pages hold the keyboard to hand back.
+fn workspace_shortcuts(cx: &App) -> Vec<Keystroke> {
+    cx.key_bindings()
+        .borrow()
+        .bindings()
+        .filter(|binding| binding.predicate().is_some_and(|p| p.to_string() == "Workspace"))
+        .filter_map(|binding| match binding.keystrokes() {
+            [one] => Some(one.inner().clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Cookies, cache and storage: `%LOCALAPPDATA%\Gate` on Windows,

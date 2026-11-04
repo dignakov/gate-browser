@@ -10,7 +10,7 @@ use crate::{theme, url};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Render, RenderImage,
-    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Transformation, Window, div, img,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Transformation, Window, deferred, div, img,
     percentage, prelude::FluentBuilder as _, px,
 };
 use layout::{Axis, Edge, PaneId, Rect};
@@ -129,8 +129,9 @@ impl Render for Workspace {
         root.child(frame)
             .child(self.sidebar_resize_handle(edge, cx))
             .when(dragging, |r| r.child(self.drag_overlay(area, cx)))
-            .when(self.palette.is_some(), |r| r.child(self.render_palette(area, cx)))
-            .when(self.settings.is_some(), |r| r.child(self.settings_dialog(vw, vh, cx)))
+            // Above the pages (see `pane_card`), Settings above the palette.
+            .when(self.palette.is_some(), |r| r.child(deferred(self.render_palette(area, cx)).with_priority(1)))
+            .when(self.settings.is_some(), |r| r.child(deferred(self.settings_dialog(vw, vh, cx)).with_priority(2)))
             .children(chrome::resize_borders(window))
     }
 }
@@ -867,9 +868,11 @@ impl Workspace {
             .child(header)
             // Inside the card's border, which frames the page, not covers it.
             .child(div().flex_1().min_h_0().mx(px(1.)).mb(px(1.)).child(view))
-            .when(asks, |card| card.child(self.question(pane, rect, cx)))
+            // What covers the page is deferred: drawn above pages that an
+            // engine presents itself (Edge's native layer), not beneath.
+            .when(asks, |card| card.child(deferred(self.question(pane, rect, cx))))
             .child(ring)
-            .when_some(drop, |card, edge| card.child(drop_highlight(rect, edge)))
+            .when_some(drop, |card, edge| card.child(deferred(drop_highlight(rect, edge))))
             .into_any_element()
     }
 

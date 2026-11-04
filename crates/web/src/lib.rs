@@ -59,6 +59,8 @@ pub fn run_helper_process() -> Option<i32> {
         engine::Engine::Cef => engine::cef::run_helper_process(),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => None,
+        #[cfg(windows)]
+        engine::Engine::WebView2 => None,
     }
 }
 
@@ -74,6 +76,8 @@ pub fn init(profile: &Path, extensions: &[PathBuf], gpu_frames: bool, cx: &mut g
         engine::Engine::Cef => engine::cef::init(profile, extensions, gpu_frames, cx),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::init(profile, cx),
+        #[cfg(windows)]
+        engine::Engine::WebView2 => engine::webview2::init(profile, extensions, cx),
     }
 }
 
@@ -84,6 +88,8 @@ pub fn engine_name() -> &'static str {
         engine::Engine::Cef => "Chromium",
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => "WebKit",
+        #[cfg(windows)]
+        engine::Engine::WebView2 => "Edge",
     }
 }
 
@@ -106,6 +112,8 @@ pub fn on_relaunch(handler: impl Fn(Vec<String>, &mut gpui::App) + 'static) {
         engine::Engine::Cef => engine::cef::on_relaunch(handler),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::on_relaunch(handler),
+        #[cfg(windows)]
+        engine::Engine::WebView2 => engine::webview2::on_relaunch(handler),
     }
 }
 
@@ -117,7 +125,18 @@ pub fn set_dark_mode(dark: bool) {
         engine::Engine::Cef => engine::cef::set_dark_mode(dark),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::set_dark_mode(dark),
+        #[cfg(windows)]
+        engine::Engine::WebView2 => engine::webview2::set_dark_mode(dark),
     }
+}
+
+/// Gate's own shortcuts (Workspace bindings): engines whose pages hold the
+/// keyboard hand these back as [`WebEvent::Key`] instead of keeping them.
+pub fn set_app_shortcuts(shortcuts: Vec<gpui::Keystroke>) {
+    #[cfg(windows)]
+    engine::webview2::set_app_shortcuts(shortcuts);
+    #[cfg(not(windows))]
+    let _ = shortcuts;
 }
 
 /// Shuts the engine down. Every [`WebView`] must have been closed.
@@ -127,5 +146,7 @@ pub fn shutdown() {
         engine::Engine::Cef => engine::cef::shutdown(),
         #[cfg(gate_wpe)]
         engine::Engine::Wpe => engine::wpe::shutdown(),
+        #[cfg(windows)]
+        engine::Engine::WebView2 => engine::webview2::shutdown(),
     }
 }

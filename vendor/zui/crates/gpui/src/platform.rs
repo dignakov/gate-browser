@@ -287,6 +287,13 @@ pub trait Platform: 'static {
 
     fn set_cursor_style(&self, style: CursorStyle);
 
+    /// Shows a platform cursor (see [`NativeCursor`]); platforms without
+    /// them show `fallback`.
+    fn set_native_cursor(&self, cursor: NativeCursor, fallback: CursorStyle) {
+        let _ = cursor;
+        self.set_cursor_style(fallback);
+    }
+
     /// Hides the mouse cursor until the user moves the mouse over one of
     /// this application's windows.
     fn hide_cursor_until_mouse_moves(&self);
@@ -807,6 +814,43 @@ pub struct NativeComposition {
     pub generation: u64,
 }
 
+/// A cursor of the platform's own (Windows: an `HCURSOR`), such as an
+/// embedded web view's custom cursors, which no [`CursorStyle`] matches.
+/// Borrowed: whoever made it keeps it alive while it's shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeCursor(pub usize);
+
+/// What a system drag over the window is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeDragKind {
+    /// The drag entered the window.
+    Enter,
+    /// The drag moved within the window.
+    Over,
+    /// The drag left the window or was cancelled.
+    Leave,
+    /// The drag was dropped on the window.
+    Drop,
+}
+
+/// A system drag over the window (Windows: OLE drag and drop), offered to
+/// native children such as embedded web views before GPUI's own file drops.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeDrag {
+    /// What the drag is doing.
+    pub kind: NativeDragKind,
+    /// The dragged data (Windows: `IDataObject*`), borrowed for the call:
+    /// set on [`NativeDragKind::Enter`] and [`NativeDragKind::Drop`], null
+    /// otherwise. `AddRef` it to keep it for the rest of the drag.
+    pub data: *mut std::ffi::c_void,
+    /// Held keys and buttons (Windows: `MK_*`).
+    pub key_state: u32,
+    /// The pointer in the window's client area, in physical pixels.
+    pub position: Point<DevicePixels>,
+    /// The effects the drag's source allows (Windows: `DROPEFFECT_*`).
+    pub allowed: u32,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -877,6 +921,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn native_composition(&self) -> Option<NativeComposition> {
         None
     }
+
+    /// Offers system drags over the window to `callback` first: it returns
+    /// the drop effect when a native child takes the event, or `None` to
+    /// leave it to GPUI. Windows only; ignored elsewhere.
+    fn on_native_drag(&self, _callback: Box<dyn FnMut(NativeDrag) -> Option<u32>>) {}
 
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;

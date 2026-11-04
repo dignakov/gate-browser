@@ -5,6 +5,8 @@
 
 #[cfg(feature = "cef")]
 pub(crate) mod cef;
+#[cfg(windows)]
+pub(crate) mod webview2;
 #[cfg(gate_wpe)]
 pub(crate) mod wpe;
 
@@ -29,6 +31,10 @@ pub(crate) enum PageEvent {
     Playback(Playback),
     Crashed,
     Cursor(CursorStyle),
+    /// The page's own cursor (engines whose cursors GPUI's styles can't
+    /// all name), with the closest style for platforms without them.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    NativeCursor { cursor: gpui::NativeCursor, fallback: CursorStyle },
     /// The page copied text (engines that don't reach the clipboard
     /// themselves).
     #[cfg_attr(not(gate_wpe), allow(dead_code))]
@@ -44,6 +50,10 @@ pub(crate) enum PageEvent {
     /// Chromium on Linux needs one so far.)
     #[cfg_attr(not(all(target_os = "linux", feature = "cef")), allow(dead_code))]
     Pump,
+    /// One of Gate's shortcuts, pressed while the page held the keyboard
+    /// (engines whose pages take Windows' keyboard focus).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Key(Keystroke),
     Closed,
 }
 
@@ -134,21 +144,36 @@ pub(crate) enum Engine {
     Cef,
     #[cfg(gate_wpe)]
     Wpe,
+    #[cfg(windows)]
+    WebView2,
 }
 
-/// This run's engine: WPE WebKit on Linux, Chromium elsewhere. A Linux
-/// build with both (the `cef` feature) runs Chromium with `GATE_ENGINE=cef`.
+/// This run's engine: Edge (WebView2) on Windows, WPE WebKit on Linux,
+/// Chromium elsewhere. A build with Chromium as well (the `cef` feature)
+/// runs it with `GATE_ENGINE=cef`.
 pub(crate) fn engine() -> Engine {
-    #[cfg(all(gate_wpe, feature = "cef"))]
+    #[cfg(feature = "cef")]
+    let chromium = || {
+        static CHROMIUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CHROMIUM.get_or_init(|| std::env::var("GATE_ENGINE").as_deref() == Ok("cef"))
+    };
+    #[cfg(windows)]
     {
-        static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
-        *ENGINE.get_or_init(|| if std::env::var("GATE_ENGINE").as_deref() == Ok("cef") { Engine::Cef } else { Engine::Wpe })
+        #[cfg(feature = "cef")]
+        if chromium() {
+            return Engine::Cef;
+        }
+        Engine::WebView2
     }
-    #[cfg(all(gate_wpe, not(feature = "cef")))]
+    #[cfg(all(not(windows), gate_wpe))]
     {
+        #[cfg(feature = "cef")]
+        if chromium() {
+            return Engine::Cef;
+        }
         Engine::Wpe
     }
-    #[cfg(not(gate_wpe))]
+    #[cfg(all(not(windows), not(gate_wpe)))]
     {
         Engine::Cef
     }
@@ -161,5 +186,7 @@ pub(crate) fn new_page(url: &str, events: Events, window: &mut Window) -> Box<dy
         Engine::Cef => Box::new(cef::CefPage::new(url, events, window)),
         #[cfg(gate_wpe)]
         Engine::Wpe => Box::new(wpe::WpePage::new(url, events, window)),
+        #[cfg(windows)]
+        Engine::WebView2 => Box::new(webview2::WebView2Page::new(url, events, window)),
     }
 }

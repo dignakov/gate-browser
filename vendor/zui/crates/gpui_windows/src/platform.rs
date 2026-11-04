@@ -102,6 +102,18 @@ impl WindowsPlatformState {
 }
 
 impl WindowsPlatform {
+    /// Makes `hcursor` the cursor GPUI's windows show.
+    fn show_cursor(&self, hcursor: Option<HCURSOR>) {
+        if self.inner.state.current_cursor.get().map(|c| c.0) != hcursor.map(|c| c.0) {
+            self.post_message(
+                WM_GPUI_CURSOR_STYLE_CHANGED,
+                WPARAM(0),
+                LPARAM(hcursor.map_or(0, |c| c.0 as isize)),
+            );
+            self.inner.state.current_cursor.set(hcursor);
+        }
+    }
+
     pub fn new(headless: bool) -> Result<Self> {
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
@@ -352,6 +364,12 @@ impl WindowsPlatform {
 
 fn translate_accelerator(msg: &MSG) -> Option<()> {
     if msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN {
+        return None;
+    }
+    // Keys for other windows of this thread (embedded native views, such
+    // as a web view's input window) are theirs: they'd answer the private
+    // message with 0 and lose every key.
+    if !is_gpui_window(msg.hwnd) {
         return None;
     }
 
@@ -732,15 +750,12 @@ impl Platform for WindowsPlatform {
     }
 
     fn set_cursor_style(&self, style: CursorStyle) {
-        let hcursor = load_cursor(style);
-        if self.inner.state.current_cursor.get().map(|c| c.0) != hcursor.map(|c| c.0) {
-            self.post_message(
-                WM_GPUI_CURSOR_STYLE_CHANGED,
-                WPARAM(0),
-                LPARAM(hcursor.map_or(0, |c| c.0 as isize)),
-            );
-            self.inner.state.current_cursor.set(hcursor);
-        }
+        self.show_cursor(load_cursor(style));
+    }
+
+    fn set_native_cursor(&self, cursor: NativeCursor, fallback: CursorStyle) {
+        let hcursor = HCURSOR(cursor.0 as *mut _);
+        self.show_cursor(if hcursor.is_invalid() { load_cursor(fallback) } else { Some(hcursor) });
     }
 
     fn hide_cursor_until_mouse_moves(&self) {

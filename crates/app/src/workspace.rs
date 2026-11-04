@@ -486,6 +486,17 @@ impl Workspace {
     fn web_event(&mut self, pane: PaneId, event: &WebEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             WebEvent::OpenTab { url, background } => self.open_tab(url, !background, window, cx),
+            // A shortcut pressed while the page held the keyboard. Replayed
+            // once this update is over: its action handlers update the
+            // workspace, which is busy here.
+            WebEvent::Key(keystroke) => {
+                let keystroke = keystroke.clone();
+                window.defer(cx, move |window, cx| {
+                    let shown = keystroke.unparse();
+                    let handled = window.dispatch_keystroke(keystroke, cx);
+                    tracing::debug!("shortcut {shown} from a page: handled {handled}");
+                });
+            }
             // The page took focus (clicked, usually): it is the focused pane.
             WebEvent::Focused => {
                 if let Some(tab) = self.tabs.get_mut(self.active)

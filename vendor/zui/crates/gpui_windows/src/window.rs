@@ -384,6 +384,7 @@ pub(crate) struct Callbacks {
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) native_drag: Cell<Option<Box<dyn FnMut(NativeDrag) -> Option<u32>>>>,
 }
 
 struct WindowCreateContext {
@@ -1019,6 +1020,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().native_composition()
     }
 
+    fn on_native_drag(&self, callback: Box<dyn FnMut(NativeDrag) -> Option<u32>>) {
+        self.state.callbacks.native_drag.set(Some(callback));
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }
@@ -1111,8 +1116,10 @@ impl accesskit::ActionHandler for A11yActionHandler {
     }
 }
 
+/// The window's OLE drop target: drags go to native children first (see
+/// `on_native_drag`), the rest to GPUI as file drops.
 #[implement(IDropTarget)]
-struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>);
+struct WindowsDragDropHandler(pub Rc<WindowsWindowInner>, Cell<bool>);
 
 impl WindowsDragDropHandler {
     fn handle_drag_drop(&self, input: PlatformInput) {
@@ -1120,6 +1127,36 @@ impl WindowsDragDropHandler {
             func(input);
             self.0.state.callbacks.input.set(Some(func));
         }
+    }
+
+    /// Offers the event to native children: the effect if one took it. GPUI
+    /// hears its file drag left when a native child takes it over.
+    fn offer_native(
+        &self,
+        kind: NativeDragKind,
+        data: Option<&IDataObject>,
+        key_state: MODIFIERKEYS_FLAGS,
+        pt: &POINTL,
+        allowed: DROPEFFECT,
+    ) -> Option<DROPEFFECT> {
+        let mut position = POINT { x: pt.x, y: pt.y };
+        // SAFETY: converting a point for this window.
+        unsafe { ScreenToClient(self.0.hwnd, &mut position) }.ok().log_err();
+        let drag = NativeDrag {
+            kind,
+            data: data.map_or(std::ptr::null_mut(), |d| d.as_raw()),
+            key_state: key_state.0,
+            position: point(DevicePixels(position.x), DevicePixels(position.y)),
+            allowed: allowed.0,
+        };
+        let mut callback = self.0.state.callbacks.native_drag.take()?;
+        let taken = callback(drag);
+        self.0.state.callbacks.native_drag.set(Some(callback));
+        let was_native = self.1.replace(taken.is_some());
+        if taken.is_some() && !was_native && kind == NativeDragKind::Over {
+            self.handle_drag_drop(PlatformInput::FileDrop(FileDropEvent::Exited));
+        }
+        taken.map(DROPEFFECT)
     }
 }
 
@@ -1134,6 +1171,17 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         unsafe {
             let idata_obj = pdataobj.ok()?;
+            if let Some(effect) =
+                self.offer_native(NativeDragKind::Enter, Some(idata_obj), _grfkeystate, pt, *pdweffect)
+            {
+                *pdweffect = effect;
+                let cursor_position = POINT { x: pt.x, y: pt.y };
+                self.0
+                    .drop_target_helper
+                    .DragEnter(self.0.hwnd, idata_obj, &cursor_position, effect)
+                    .log_err();
+                return Ok(());
+            }
             let config = FORMATETC {
                 cfFormat: CF_HDROP.0,
                 ptd: std::ptr::null_mut() as _,
@@ -1190,6 +1238,16 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         pdweffect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
+        // SAFETY: OLE hands a valid effect pointer for the call.
+        if let Some(effect) =
+            self.offer_native(NativeDragKind::Over, None, _grfkeystate, pt, unsafe { *pdweffect })
+        {
+            unsafe {
+                *pdweffect = effect;
+                self.0.drop_target_helper.DragOver(&cursor_position, effect).log_err();
+            }
+            return Ok(());
+        }
         unsafe {
             *pdweffect = DROPEFFECT_COPY;
             self.0
@@ -1214,6 +1272,16 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     }
 
     fn DragLeave(&self) -> windows::core::Result<()> {
+        let native = self
+            .offer_native(NativeDragKind::Leave, None, MODIFIERKEYS_FLAGS(0), &POINTL::default(), DROPEFFECT_NONE)
+            .is_some();
+        self.1.set(false);
+        if native {
+            unsafe {
+                self.0.drop_target_helper.DragLeave().log_err();
+            }
+            return Ok(());
+        }
         unsafe {
             self.0.drop_target_helper.DragLeave().log_err();
         }
@@ -1232,6 +1300,21 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
+        // SAFETY: OLE hands a valid effect pointer for the call.
+        if let Some(effect) =
+            self.offer_native(NativeDragKind::Drop, Some(idata_obj), _grfkeystate, pt, unsafe { *pdweffect })
+        {
+            self.1.set(false);
+            unsafe {
+                *pdweffect = effect;
+                self.0
+                    .drop_target_helper
+                    .Drop(idata_obj, &cursor_position, effect)
+                    .log_err();
+            }
+            return Ok(());
+        }
+        self.1.set(false);
         unsafe {
             *pdweffect = DROPEFFECT_COPY;
             self.0
@@ -1452,6 +1535,16 @@ unsafe extern "system" fn window_procedure(
     result
 }
 
+/// Whether `hwnd` is one of GPUI's windows (by its class), as opposed to
+/// another window on this thread, such as an embedded native view's.
+pub(crate) fn is_gpui_window(hwnd: HWND) -> bool {
+    let mut name = [0u16; 32];
+    // SAFETY: reads the class name into a local buffer.
+    let len = unsafe { GetClassNameW(hwnd, &mut name) } as usize;
+    // SAFETY: WINDOW_CLASS_NAME is a static, NUL-terminated wide string.
+    len > 0 && name[..len] == *unsafe { WINDOW_CLASS_NAME.as_wide() }
+}
+
 pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
     if hwnd.is_invalid() {
         return None;
@@ -1482,7 +1575,7 @@ fn get_module_handle() -> HMODULE {
 
 fn register_drag_drop(window: &Rc<WindowsWindowInner>) -> Result<()> {
     let window_handle = window.hwnd;
-    let handler = WindowsDragDropHandler(window.clone());
+    let handler = WindowsDragDropHandler(window.clone(), Cell::new(false));
     // The lifetime of `IDropTarget` is handled by Windows, it won't release until
     // we call `RevokeDragDrop`.
     // So, it's safe to drop it here.

@@ -28,3 +28,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 web = { workspace = true, features = ["cef"] }
+
+[build-dependencies]
+embed-resource = "3"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }

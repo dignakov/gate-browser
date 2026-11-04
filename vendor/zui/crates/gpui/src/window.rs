@@ -597,6 +597,8 @@ pub(crate) type AnyMouseListener =
 pub(crate) struct CursorStyleRequest {
     pub(crate) hitbox_id: Option<HitboxId>,
     pub(crate) style: CursorStyle,
+    /// Shown instead of `style` where the platform can.
+    pub(crate) native: Option<crate::NativeCursor>,
 }
 
 #[derive(Default, Eq, PartialEq)]
@@ -995,16 +997,17 @@ impl Frame {
         }
     }
 
-    pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
+    /// The cursor request that applies where the pointer is.
+    pub(crate) fn cursor_request(&self, window: &Window) -> Option<&CursorStyleRequest> {
         self.cursor_styles
             .iter()
             .rev()
-            .fold_while(None, |style, request| match request.hitbox_id {
-                None => Done(Some(request.style)),
-                Some(hitbox_id) => Continue(style.or_else(|| {
+            .fold_while(None, |found, request| match request.hitbox_id {
+                None => Done(Some(request)),
+                Some(hitbox_id) => Continue(found.or_else(|| {
                     hitbox_id
                         .is_hovered_ignoring_last_input(window)
-                        .then_some(request.style)
+                        .then_some(request)
                 })),
             })
             .into_inner()
@@ -3031,6 +3034,12 @@ impl Window {
         self.platform_window.native_composition()
     }
 
+    /// Offers system drags over the window to native children first (see
+    /// [`crate::PlatformWindow::on_native_drag`]). One handler per window.
+    pub fn on_native_drag(&self, callback: impl FnMut(crate::NativeDrag) -> Option<u32> + 'static) {
+        self.platform_window.on_native_drag(Box::new(callback));
+    }
+
     /// Schedule a native-view update from an element's paint pass. Painting
     /// can run solely to refresh input hit testing, without presenting a frame.
     /// These updates run only when the corresponding scene reaches the screen,
@@ -3529,6 +3538,20 @@ impl Window {
         self.next_frame.cursor_styles.push(CursorStyleRequest {
             hitbox_id: Some(hitbox.id),
             style,
+            native: None,
+        });
+    }
+
+    /// Like [`Self::set_cursor_style`], with a platform cursor (see
+    /// [`crate::NativeCursor`]) shown instead of `fallback` where the
+    /// platform has them. This method should only be called during the
+    /// paint phase of element drawing.
+    pub fn set_native_cursor(&mut self, cursor: crate::NativeCursor, fallback: CursorStyle, hitbox: &Hitbox) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.cursor_styles.push(CursorStyleRequest {
+            hitbox_id: Some(hitbox.id),
+            style: fallback,
+            native: Some(cursor),
         });
     }
 
@@ -3541,6 +3564,7 @@ impl Window {
         self.next_frame.cursor_styles.push(CursorStyleRequest {
             hitbox_id: None,
             style,
+            native: None,
         })
     }
 
@@ -5319,11 +5343,14 @@ impl Window {
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
         if self.is_window_hovered() {
-            let style = self
-                .rendered_frame
-                .cursor_style(self)
-                .unwrap_or(CursorStyle::Arrow);
-            cx.platform.set_cursor_style(style);
+            match self.rendered_frame.cursor_request(self) {
+                Some(CursorStyleRequest { native: Some(cursor), style, .. }) => {
+                    cx.platform.set_native_cursor(*cursor, *style)
+                }
+                request => cx
+                    .platform
+                    .set_cursor_style(request.map_or(CursorStyle::Arrow, |r| r.style)),
+            }
         }
     }
 

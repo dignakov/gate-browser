@@ -32,3 +32,14 @@ libc = "0.2"
 serde_json.workspace = true
 # SVG favicons, which WebKit's icon database does not decode.
 resvg = { version = "0.46", default-features = false }
+
+# Edge (WebView2) in visual-hosting mode, composited in zui's overlay plane;
+# windows 0.61 as gpui_windows uses, so COM types interoperate.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_DirectComposition", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Pipes", "Win32_System_IO", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows-core = "0.61"
+raw-window-handle = "0.6"
+serde_json.workspace = true
+# Favicons arrive as PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
