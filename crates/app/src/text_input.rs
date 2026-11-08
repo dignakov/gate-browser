@@ -1,11 +1,13 @@
 //! A single-line text field (the address bar), from GPUI's input example:
-//! platform text input (IME included) through `EntityInputHandler`.
+//! platform text input (IME included) through `EntityInputHandler`. A
+//! right click shows its menu: cut, copy, paste, select all.
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
+    Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, anchored, deferred, div, fill, point, prelude::*, px,
+    relative, size,
 };
 use crate::theme;
 use std::ops::Range;
@@ -57,6 +59,10 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// The right-click menu, open at this point (window coordinates).
+    menu: Option<Point<Pixels>>,
+    /// The menu offers "Paste and go" (a submit of what is pasted).
+    pub paste_and_go: bool,
     /// Colors for text on something other than the theme's surfaces
     /// (`None`: the theme's).
     pub text_color: Option<Hsla>,
@@ -76,6 +82,7 @@ impl TextInput {
         let focus = cx.focus_handle();
         cx.on_focus(&focus, window, |_, _, cx| cx.emit(InputEvent::Focused)).detach();
         cx.on_blur(&focus, window, |this, _, cx| {
+            this.menu = None;
             this.selected_range = this.content.len()..this.content.len();
             cx.emit(InputEvent::Blurred);
         })
@@ -90,6 +97,8 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            menu: None,
+            paste_and_go: false,
             text_color: None,
             placeholder_color: None,
         }
@@ -175,7 +184,103 @@ impl TextInput {
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        // Esc closes the menu first.
+        if self.menu.take().is_some() {
+            return cx.notify();
+        }
         cx.emit(InputEvent::Cancel);
+    }
+
+    fn on_right_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Into an unfocused field, as a left click: it all gets selected.
+        if !self.focus.is_focused(window) {
+            window.focus(&self.focus, cx);
+            self.select_all_text(cx);
+        }
+        self.menu = Some(event.position);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn paste_and_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
+        self.content = SharedString::default();
+        self.selected_range = 0..0;
+        self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+        cx.emit(InputEvent::Submit(self.content.to_string()));
+    }
+
+    /// The right-click menu, over everything (pages included).
+    fn render_menu(&self, at: Point<Pixels>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let selected = !self.selected_range.is_empty();
+        let item = |id: &'static str, label: &'static str, key: Option<&'static str>, enabled: bool| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(24.))
+                .h(px(26.))
+                .px(px(10.))
+                .rounded(px(5.))
+                .text_size(px(12.5))
+                .text_color(if enabled { theme::text() } else { theme::text_dim() })
+                .when(enabled, |d| d.hover(|s| s.bg(theme::hover())))
+                .child(label)
+                .children(key.map(|k| div().text_size(px(11.)).text_color(theme::text_dim()).child(k)))
+        };
+        let entity = cx.entity().downgrade();
+        let act = |run: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let entity = entity.clone();
+            move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                cx.stop_propagation();
+                let _ = entity.update(cx, |this, cx| {
+                    this.menu = None;
+                    run(this, window, cx);
+                    cx.notify();
+                });
+            }
+        };
+        let card = div()
+            .flex()
+            .flex_col()
+            .min_w(px(180.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::popover())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
+            .child(item("text-menu-cut", "Cut", Some("Ctrl+X"), selected).when(selected, |d| {
+                d.on_mouse_down(MouseButton::Left, act(|this, window, cx| this.cut(&Cut, window, cx)))
+            }))
+            .child(item("text-menu-copy", "Copy", Some("Ctrl+C"), selected).when(selected, |d| {
+                d.on_mouse_down(MouseButton::Left, act(|this, window, cx| this.copy(&Copy, window, cx)))
+            }))
+            .child(item("text-menu-paste", "Paste", Some("Ctrl+V"), true).on_mouse_down(
+                MouseButton::Left,
+                act(|this, window, cx| this.paste(&Paste, window, cx)),
+            ))
+            .when(self.paste_and_go, |c| {
+                c.child(item("text-menu-paste-go", "Paste and go", None, true).on_mouse_down(
+                    MouseButton::Left,
+                    act(|this, window, cx| this.paste_and_submit(window, cx)),
+                ))
+            })
+            .child(div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(theme::border()))
+            .child(item("text-menu-select-all", "Select all", Some("Ctrl+A"), !self.content.is_empty()).on_mouse_down(
+                MouseButton::Left,
+                act(|this, _, cx| this.select_all_text(cx)),
+            ));
+        deferred(anchored().position(at).snap_to_window_with_margin(px(8.)).child(card)).with_priority(3).into_any_element()
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -564,6 +669,7 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu = self.menu.map(|at| self.render_menu(at, cx));
         div()
             .flex()
             .flex_1()
@@ -589,6 +695,8 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .child(TextElement { input: cx.entity() })
+            .children(menu)
     }
 }

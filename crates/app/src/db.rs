@@ -154,6 +154,16 @@ impl Db {
         pages
     }
 
+    /// The pages visited last, latest first.
+    pub fn recent(&self, limit: usize) -> Vec<Page> {
+        let mut pages = self.pages("SELECT url, title, visits, last FROM pages WHERE ?1 = ?1 ORDER BY last DESC LIMIT 400", "").unwrap_or_else(|error| {
+            tracing::warn!("reading history: {error}");
+            Vec::new()
+        });
+        pages.truncate(limit);
+        pages
+    }
+
     fn pages(&self, sql: &str, arg: &str) -> rusqlite::Result<Vec<Page>> {
         let mut statement = self.conn.prepare_cached(sql)?;
         let rows = statement.query_map([arg], |r| {

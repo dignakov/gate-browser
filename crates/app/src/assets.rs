@@ -12,7 +12,7 @@ macro_rules! icons {
 static ICONS: &[(&str, &[u8])] = icons![
     "arrow-left", "arrow-right", "rotate-cw", "x", "plus", "minus", "panel-left", "globe", "search", "lock",
     "columns-2", "rows-2", "maximize-2", "minimize-2", "mic", "video", "triangle-alert", "loader", "volume-2", "volume-x", "play", "pause",
-    "settings", "shield", "external-link", "palette",
+    "settings", "shield", "external-link", "palette", "download", "folder", "bell", "circle-alert",
 ];
 
 static FONTS: &[&[u8]] = &[

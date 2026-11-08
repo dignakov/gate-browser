@@ -1,0 +1,45 @@
+A paste's clipboardData.types lists the clipboard's formats whatever wrote
+them, not only with WebKit's own custom data present (Google Chat checks
+types before reading).
+
+--- a/Source/WebKit/UIProcess/wpe/WebPasteboardProxyWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/WebPasteboardProxyWPE.cpp
+@@ -159,26 +159,28 @@
+ #if ENABLE(WPE_PLATFORM)
+     if (WKWPE::isUsingWPEPlatformAPI()) {
+         auto* clipboard = wpe_display_get_clipboard(wpe_display_get_primary());
++        ListHashSet<String> domTypes;
++        // Custom types are there only for content a page of this origin wrote; the
++        // standard formats are listed whatever wrote them (other applications too).
+         if (GRefPtr<GBytes> bytes = adoptGRef(wpe_clipboard_read_bytes(clipboard, PasteboardCustomData::wpeType().characters()))) {
+-            ListHashSet<String> domTypes;
+             Ref buffer = SharedBuffer::create(bytes.get());
+             auto customData = PasteboardCustomData::fromSharedBuffer(buffer.get());
+             if (customData.origin() == origin) {
+                 for (auto& type : customData.orderedTypes())
+                     domTypes.add(type);
+             }
++        }
+ 
+-            for (const char* format : span(wpe_clipboard_get_formats(clipboard))) {
+-                String formatString = String::fromUTF8(format);
+-                if (formatString == PasteboardCustomData::wpeType())
+-                    continue;
++        for (const char* format : span(wpe_clipboard_get_formats(clipboard))) {
++            String formatString = String::fromUTF8(format);
++            if (formatString == PasteboardCustomData::wpeType())
++                continue;
+ 
+-                if (Pasteboard::isSafeTypeForDOMToReadAndWrite(formatString))
+-                    domTypes.add(formatString);
+-            }
+-            completionHandler(copyToVector(domTypes));
+-            return;
++            if (Pasteboard::isSafeTypeForDOMToReadAndWrite(formatString))
++                domTypes.add(formatString);
+         }
++        completionHandler(copyToVector(domTypes));
++        return;
+     }
+ #endif
+     completionHandler({ });

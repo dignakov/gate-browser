@@ -86,6 +86,13 @@ struct _Page {
     guint8 *mirror;
     guint mirror_id;
     int mirror_width, mirror_height;
+    GHashTable *notifications; // WebKit's id -> WebKitNotification shown
+    // Its only navigation became a download: no document, so no address
+    // (a restored session would download it again).
+    gboolean only_downloaded;
+    // The right-click menu Gate shows: its items, and the link it was on.
+    GPtrArray *context_items; // WebKitContextMenuItem, separators included
+    gchar *context_link;
 };
 
 // ---------------------------------------------------------------- protocol
@@ -188,6 +195,10 @@ typedef struct {
 } ZClipboardClass;
 G_DEFINE_TYPE(ZClipboard, z_clipboard, WPE_TYPE_CLIPBOARD)
 static guint clipboard_page;
+// The page the user last pressed a paste key in, and when: a read of the
+// clipboard it makes for that key needs no question.
+static guint paste_page;
+static gint64 paste_time;
 static void z_clipboard_changed(WPEClipboard *clipboard, GPtrArray *formats, gboolean local,
                                 WPEClipboardContent *content) {
     WPE_CLIPBOARD_CLASS(z_clipboard_parent_class)->changed(clipboard, formats, local, content);
@@ -877,7 +888,7 @@ static void z_display_init(ZDisplay *d) {
 static void state(Page *p) {
     JsonBuilder *b = json_builder_new();
     json_builder_begin_object(b);
-    member_string(b, "url", webkit_web_view_get_uri(p->web));
+    member_string(b, "url", p->only_downloaded ? "about:blank" : webkit_web_view_get_uri(p->web));
     member_string(b, "title", webkit_web_view_get_title(p->web) ?: "");
     member_string(b, "error", p->error);
     member_bool(b, "loading", webkit_web_view_is_loading(p->web));
@@ -919,6 +930,8 @@ static void loaded(WebKitWebView *web, WebKitLoadEvent event, Page *p) {
     if (event == WEBKIT_LOAD_STARTED)
         g_clear_pointer(&p->error, g_free);
     // A new document: its frames' media scripts start over.
+    if (event == WEBKIT_LOAD_STARTED)
+        p->only_downloaded = FALSE;
     if (event == WEBKIT_LOAD_COMMITTED)
         clear_media(p);
     if (event == WEBKIT_LOAD_FINISHED)
@@ -940,16 +953,28 @@ static void terminated(WebKitWebView *web, WebKitWebProcessTerminationReason rea
 static gboolean allowed(const char *uri) {
     return uri && *uri && g_ascii_strncasecmp(uri, "javascript:", 11);
 }
-static void open_tab(Page *p, const char *uri, gboolean background) {
+static void open_tab(Page *p, const char *uri, gboolean background, gboolean alternate) {
     JsonBuilder *b = json_builder_new();
     json_builder_begin_object(b);
     member_string(b, "url", uri);
     member_bool(b, "background", background);
+    member_bool(b, "alternate", alternate);
     json_builder_end_object(b);
     send_json('N', p->id, b);
 }
 static gboolean policy(WebKitWebView *web, WebKitPolicyDecision *decision,
                        WebKitPolicyDecisionType type, Page *p) {
+    // What the page can't show is downloaded, as browsers do (WebKit
+    // ignores it unless told).
+    if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
+        WebKitResponsePolicyDecision *response = WEBKIT_RESPONSE_POLICY_DECISION(decision);
+        guint status = webkit_uri_response_get_status_code(webkit_response_policy_decision_get_response(response));
+        if (!webkit_response_policy_decision_is_mime_type_supported(response) && status != 204 && status < 400) {
+            webkit_policy_decision_download(decision);
+            return TRUE;
+        }
+        return FALSE;
+    }
     if (type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION ||
         type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
         WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(
@@ -961,16 +986,37 @@ static gboolean policy(WebKitWebView *web, WebKitPolicyDecision *decision,
             webkit_navigation_action_get_navigation_type(action) ==
                 WEBKIT_NAVIGATION_TYPE_LINK_CLICKED &&
             (button == 2 || (mods & (WPE_MODIFIER_KEYBOARD_CONTROL | WPE_MODIFIER_KEYBOARD_META)));
-        if (type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION || tab_click) {
-            // Pages open windows as tabs, and only when the user asked.
+        // A middle or Ctrl+click opens the link as a space behind; other
+        // new windows go on to "create" (see create_popup).
+        if (tab_click) {
             if (webkit_navigation_action_is_user_gesture(action) && allowed(uri))
-                open_tab(p, uri, tab_click);
+                open_tab(p, uri, TRUE, (mods & WPE_MODIFIER_KEYBOARD_SHIFT) != 0);
             webkit_policy_decision_ignore(decision);
             return TRUE;
         }
     }
     return FALSE;
 }
+
+// A window the page opens (window.open, a target=_blank link) is a page of
+// its own that keeps its opener: Gate shows it as a space. Only what the
+// user asked for (a click) opens, as Chromium's popup blocker has it.
+static Page *new_page(guint id, WebKitWebView *related);
+static guint next_popup = 0x40000000;
+static WebKitWebView *create_popup(WebKitWebView *web, WebKitNavigationAction *action, Page *p) {
+    if (!webkit_navigation_action_is_user_gesture(action))
+        return NULL;
+    guint id = next_popup++;
+    // Before the page exists: Gate routes what it reports from the start.
+    gchar *json = g_strdup_printf("{\"id\":%u}", id);
+    send_packet('O', p->id, json, strlen(json));
+    g_free(json);
+    // The page keeps the view; WebKit takes no reference of its own.
+    return new_page(id, web)->web;
+}
+// Script closed the page's window (window.close(), allowed for windows it
+// opened): Gate closes its pane.
+static void close_requested(WebKitWebView *web, Page *p) { send_packet('Q', p->id, NULL, 0); }
 
 // ---------------------------------------------------------------- questions
 static void send_ask_none(Page *p) { send_packet('A', p->id, "null", 4); }
@@ -1031,6 +1077,15 @@ static gboolean permission(WebKitWebView *web, WebKitPermissionRequest *request,
         what[n++] = "protected media";
     else if (WEBKIT_IS_WEBSITE_DATA_ACCESS_PERMISSION_REQUEST(request))
         what[n++] = "storage access";
+    else if (WEBKIT_IS_CLIPBOARD_PERMISSION_REQUEST(request)) {
+        // Script reading the clipboard (Google Chat's paste does): allowed
+        // for the paste key just pressed in this page, asked otherwise.
+        if (paste_page == p->id && g_get_monotonic_time() - paste_time < G_USEC_PER_SEC) {
+            webkit_permission_request_allow(request);
+            return TRUE;
+        }
+        what[n++] = "clipboard";
+    }
     // Others (device labels for enumerateDevices) are denied without asking.
     if (!n || busy(p)) {
         webkit_permission_request_deny(request);
@@ -1225,9 +1280,78 @@ static void media_command(Page *p, const char *command) {
     g_ptr_array_unref(chosen);
 }
 
+// ---------------------------------------------------------------- right-click menu
+// Gate draws the page's menu ('H') and says which item was chosen; WebKit
+// runs it through the item's action (handled here, WebKit hands the menu
+// its page once this returns).
+static void close_context_menu(Page *p) {
+    g_clear_pointer(&p->context_items, g_ptr_array_unref);
+    g_clear_pointer(&p->context_link, g_free);
+}
+static JsonBuilder *menu_builder(double x, double y);
+// "_Open Link" -> "Open Link".
+static gchar *menu_label(const char *title) {
+    GString *out = g_string_new(NULL);
+    for (const char *c = title ? title : ""; *c; c++)
+        if (*c != '_' || c[1] == '_')
+            g_string_append_c(out, *c == '_' ? *++c : *c);
+    return g_string_free(out, FALSE);
+}
 static gboolean context_menu(WebKitWebView *web, WebKitContextMenu *menu, WebKitHitTestResult *hit,
                              Page *p) {
+    close_context_menu(p);
+    p->context_items = g_ptr_array_new_with_free_func(g_object_unref);
+    p->context_link = g_strdup(webkit_hit_test_result_get_link_uri(hit));
+    gboolean separator = TRUE; // none first, none twice
+    for (GList *l = webkit_context_menu_get_items(menu); l; l = l->next) {
+        WebKitContextMenuItem *item = l->data;
+        WebKitContextMenuAction action = webkit_context_menu_item_get_stock_action(item);
+        // No inspector here; submenus (input methods, …) aren't shown.
+        if (action == WEBKIT_CONTEXT_MENU_ACTION_INSPECT_ELEMENT || webkit_context_menu_item_get_submenu(item))
+            continue;
+        gboolean is_separator = webkit_context_menu_item_is_separator(item);
+        if (is_separator && separator)
+            continue;
+        separator = is_separator;
+        g_ptr_array_add(p->context_items, g_object_ref(item));
+    }
+    // Nor last.
+    if (p->context_items->len && separator)
+        g_ptr_array_set_size(p->context_items, p->context_items->len - 1);
+    JsonBuilder *b = menu_builder(p->pointer_x, p->pointer_y);
+    for (guint i = 0; i < p->context_items->len; i++) {
+        WebKitContextMenuItem *item = g_ptr_array_index(p->context_items, i);
+        json_builder_begin_object(b);
+        if (webkit_context_menu_item_is_separator(item)) {
+            member_bool(b, "separator", TRUE);
+        } else {
+            gchar *label = webkit_context_menu_item_get_stock_action(item) == WEBKIT_CONTEXT_MENU_ACTION_OPEN_LINK_IN_NEW_WINDOW
+                               ? g_strdup("Open Link in New Space")
+                               : menu_label(webkit_context_menu_item_get_title(item));
+            GAction *gaction = webkit_context_menu_item_get_gaction(item);
+            member_string(b, "label", label);
+            member_bool(b, "enabled", !gaction || g_action_get_enabled(gaction));
+            g_free(label);
+        }
+        json_builder_end_object(b);
+    }
+    json_builder_end_array(b);
+    json_builder_end_object(b);
+    if (p->context_items->len)
+        send_json('H', p->id, b);
+    else
+        g_object_unref(b);
     return TRUE;
+}
+static void choose_context_item(Page *p, int index) {
+    if (p->context_items && index >= 0 && (guint)index < p->context_items->len) {
+        WebKitContextMenuItem *item = g_ptr_array_index(p->context_items, index);
+        if (webkit_context_menu_item_get_stock_action(item) == WEBKIT_CONTEXT_MENU_ACTION_OPEN_LINK_IN_NEW_WINDOW && p->context_link)
+            open_tab(p, p->context_link, TRUE, FALSE);
+        else if (webkit_context_menu_item_get_gaction(item))
+            g_action_activate(webkit_context_menu_item_get_gaction(item), webkit_context_menu_item_get_gaction_target(item));
+    }
+    close_context_menu(p);
 }
 static JsonBuilder *menu_builder(double x, double y) {
     JsonBuilder *b = json_builder_new();
@@ -1285,8 +1409,187 @@ static gboolean option_menu(WebKitWebView *web, WebKitOptionMenu *menu, WebKitRe
     send_json('M', p->id, b);
     return TRUE;
 }
+// The user's answers to sites asking to show notifications, kept in the
+// profile ("1 origin" allowed, "0 origin" blocked) and given to WebKit
+// before its pages ask (Notification.permission).
+static gchar *notification_answers_path;
+static void initialize_notification_permissions(WebKitWebContext *context, gpointer data) {
+    gchar *text = NULL;
+    GList *allowed = NULL, *blocked = NULL;
+    if (notification_answers_path && g_file_get_contents(notification_answers_path, &text, NULL, NULL)) {
+        gchar **lines = g_strsplit(text, "\n", -1);
+        for (gchar **line = lines; *line; line++) {
+            if (strlen(*line) < 3 || (*line)[1] != ' ')
+                continue;
+            WebKitSecurityOrigin *origin = webkit_security_origin_new_for_uri(*line + 2);
+            if ((*line)[0] == '1')
+                allowed = g_list_prepend(allowed, origin);
+            else
+                blocked = g_list_prepend(blocked, origin);
+        }
+        g_strfreev(lines);
+        g_free(text);
+    }
+    webkit_web_context_initialize_notification_permissions(context, allowed, blocked);
+    g_list_free_full(allowed, (GDestroyNotify)webkit_security_origin_unref);
+    g_list_free_full(blocked, (GDestroyNotify)webkit_security_origin_unref);
+}
+// Keeps the user's answer for this page's site, replacing an earlier one.
+static void remember_notification_answer(Page *p, gboolean allowed) {
+    if (!notification_answers_path)
+        return;
+    WebKitSecurityOrigin *origin = webkit_security_origin_new_for_uri(webkit_web_view_get_uri(p->web) ?: "");
+    gchar *site = webkit_security_origin_to_string(origin);
+    webkit_security_origin_unref(origin);
+    if (!site)
+        return;
+    gchar *text = NULL;
+    GString *out = g_string_new(NULL);
+    if (g_file_get_contents(notification_answers_path, &text, NULL, NULL)) {
+        gchar **lines = g_strsplit(text, "\n", -1);
+        for (gchar **line = lines; *line; line++)
+            if (strlen(*line) > 2 && strcmp(*line + 2, site))
+                g_string_append_printf(out, "%s\n", *line);
+        g_strfreev(lines);
+        g_free(text);
+    }
+    g_string_append_printf(out, "%c %s\n", allowed ? '1' : '0', site);
+    g_file_set_contents(notification_answers_path, out->str, out->len, NULL);
+    g_string_free(out, TRUE);
+    g_free(site);
+}
+
+// ---------------------------------------------------------------- downloads
+// Downloads go to the Downloads folder, reported to the page that started
+// them ('D'); Gate shows them and may cancel one.
+static guint64 next_download = 1;
+static GHashTable *downloads; // id -> WebKitDownload
+static void report_download(WebKitDownload *item, const char *state, const char *error) {
+    guint page = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(item), "gate-page"));
+    const char *path = webkit_download_get_destination(item);
+    WebKitURIResponse *response = webkit_download_get_response(item);
+    guint64 total = response ? webkit_uri_response_get_content_length(response) : 0;
+    gchar *name = path ? g_path_get_basename(path) : g_strdup("");
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+    member_int(b, "id", (gint64)(guintptr)g_object_get_data(G_OBJECT(item), "gate-id"));
+    member_string(b, "name", name);
+    member_string(b, "path", path ? path : "");
+    member_int(b, "received", (gint64)webkit_download_get_received_data_length(item));
+    member_int(b, "total", (gint64)total);
+    member_string(b, "state", state);
+    member_string(b, "error", error ? error : "");
+    json_builder_end_object(b);
+    send_json('D', page, b);
+    g_free(name);
+}
+// The Downloads folder, numbered past what is there ("report (1).pdf").
+static gboolean decide_destination(WebKitDownload *item, gchar *suggested, gpointer data) {
+    const char *dir = g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD);
+    if (!dir)
+        dir = g_get_home_dir();
+    gchar *base = g_path_get_basename(suggested && *suggested ? suggested : "download");
+    g_strdelimit(base, "<>:\"/\\|?*", '_');
+    if (!strcmp(base, ".") || !strcmp(base, "..") || !*base) {
+        g_free(base);
+        base = g_strdup("download");
+    }
+    gchar *path = g_build_filename(dir, base, NULL);
+    const char *dot = strrchr(base, '.');
+    gchar *stem = dot && dot != base ? g_strndup(base, dot - base) : g_strdup(base);
+    const char *ext = dot && dot != base ? dot : "";
+    for (int n = 1; g_file_test(path, G_FILE_TEST_EXISTS); n++) {
+        g_free(path);
+        gchar *numbered = g_strdup_printf("%s (%d)%s", stem, n, ext);
+        path = g_build_filename(dir, numbered, NULL);
+        g_free(numbered);
+    }
+    webkit_download_set_destination(item, path);
+    report_download(item, "running", NULL);
+    g_free(stem);
+    g_free(base);
+    g_free(path);
+    return TRUE;
+}
+// A few progress reports a second, not one per chunk.
+static void download_data(WebKitDownload *item, guint64 length, gpointer data) {
+    gint64 now = g_get_monotonic_time();
+    gint64 last = (gint64)(gintptr)g_object_get_data(G_OBJECT(item), "gate-reported");
+    if (now - last < G_USEC_PER_SEC / 4)
+        return;
+    g_object_set_data(G_OBJECT(item), "gate-reported", (gpointer)(gintptr)now);
+    report_download(item, "running", NULL);
+}
+static void download_failed(WebKitDownload *item, GError *error, gpointer data) {
+    gboolean cancelled = g_error_matches(error, WEBKIT_DOWNLOAD_ERROR, WEBKIT_DOWNLOAD_ERROR_CANCELLED_BY_USER);
+    report_download(item, cancelled ? "cancelled" : "failed", error->message);
+    g_object_set_data(G_OBJECT(item), "gate-failed", GINT_TO_POINTER(1));
+}
+static void download_finished(WebKitDownload *item, gpointer data) {
+    if (!g_object_get_data(G_OBJECT(item), "gate-failed"))
+        report_download(item, "done", NULL);
+    g_hash_table_remove(downloads, g_object_get_data(G_OBJECT(item), "gate-id"));
+}
 static void download(WebKitNetworkSession *session, WebKitDownload *item, gpointer data) {
-    webkit_download_cancel(item);
+    WebKitWebView *web = webkit_download_get_web_view(item);
+    Page *owner = NULL;
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, pages);
+    while (g_hash_table_iter_next(&iter, &key, &value))
+        if (((Page *)value)->web == web)
+            owner = value;
+    // Nothing would show it: no page of Gate's started it.
+    if (!owner) {
+        webkit_download_cancel(item);
+        return;
+    }
+    if (!webkit_back_forward_list_get_current_item(webkit_web_view_get_back_forward_list(web))) {
+        owner->only_downloaded = TRUE;
+        state(owner);
+    }
+    guint64 id = next_download++;
+    g_object_set_data(G_OBJECT(item), "gate-id", (gpointer)(guintptr)id);
+    g_object_set_data(G_OBJECT(item), "gate-page", GUINT_TO_POINTER(owner->id));
+    if (!downloads)
+        downloads = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_object_unref);
+    g_hash_table_insert(downloads, (gpointer)(guintptr)id, g_object_ref(item));
+    g_signal_connect(item, "decide-destination", G_CALLBACK(decide_destination), NULL);
+    g_signal_connect(item, "received-data", G_CALLBACK(download_data), NULL);
+    g_signal_connect(item, "failed", G_CALLBACK(download_failed), NULL);
+    g_signal_connect(item, "finished", G_CALLBACK(download_finished), NULL);
+}
+
+// ---------------------------------------------------------------- notifications
+// A page's notifications go to Gate ('L'), which shows them; taken back by
+// the page, Gate is told ('Z').
+static void notification_closed(WebKitNotification *n, Page *p) {
+    guint64 id = webkit_notification_get_id(n);
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+    member_int(b, "id", (gint64)id);
+    json_builder_end_object(b);
+    send_json('Z', p->id, b);
+    g_hash_table_remove(p->notifications, (gpointer)(guintptr)id);
+}
+static gboolean show_notification(WebKitWebView *web, WebKitNotification *n, Page *p) {
+    guint64 id = webkit_notification_get_id(n);
+    if (!g_hash_table_contains(p->notifications, (gpointer)(guintptr)id)) {
+        g_hash_table_insert(p->notifications, (gpointer)(guintptr)id, g_object_ref(n));
+        g_signal_connect(n, "closed", G_CALLBACK(notification_closed), p);
+    }
+    JsonBuilder *b = json_builder_new();
+    json_builder_begin_object(b);
+    member_int(b, "id", (gint64)id);
+    member_string(b, "title", webkit_notification_get_title(n) ?: "");
+    member_string(b, "body", webkit_notification_get_body(n) ?: "");
+    json_builder_end_object(b);
+    send_json('L', p->id, b);
+    return TRUE;
+}
+static void drop_notification(gpointer n) {
+    g_signal_handlers_disconnect_matched(n, G_SIGNAL_MATCH_FUNC, 0, 0, NULL, notification_closed, NULL);
+    g_object_unref(n);
 }
 static void toplevel_changed(WPEView *view, GParamSpec *spec, Page *p) {
     WPEToplevel *toplevel = wpe_view_get_toplevel(view);
@@ -1313,6 +1616,8 @@ static void free_page(gpointer data) {
     g_hash_table_destroy(p->held);
     g_hash_table_destroy(p->media_state);
     g_hash_table_destroy(p->media_reply);
+    g_hash_table_destroy(p->notifications);
+    close_context_menu(p);
     close_mirror(p);
     g_object_unref(p->web);
     wpe_display_screen_removed(display, p->screen);
@@ -1321,7 +1626,8 @@ static void free_page(gpointer data) {
     g_free(p);
 }
 static void reply_unref(gpointer reply) { webkit_script_message_reply_unref(reply); }
-static Page *new_page(guint id) {
+// A page; one a page opened shares `related`'s web process and session.
+static Page *new_page(guint id, WebKitWebView *related) {
     Page *p = g_new0(Page, 1);
     p->id = id;
     p->width = 800;
@@ -1333,6 +1639,7 @@ static Page *new_page(guint id) {
     p->held = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_object_unref);
     p->media_state = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     p->media_reply = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, reply_unref);
+    p->notifications = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, drop_notification);
     p->screen = g_object_new(z_screen_get_type(), "id", id, NULL);
     ((ZScreen *)p->screen)->page = id;
     wpe_screen_set_scale(p->screen, 1);
@@ -1348,8 +1655,12 @@ static Page *new_page(guint id) {
     webkit_user_content_manager_register_script_message_handler_with_reply(content, "gateMediaListen",
                                                                            MEDIA_WORLD);
     creating = p;
-    p->web = g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", display, "network-session", session,
-                          "settings", settings, "user-content-manager", content, NULL);
+    if (related)
+        p->web = g_object_new(WEBKIT_TYPE_WEB_VIEW, "related-view", related, "settings", settings,
+                              "user-content-manager", content, NULL);
+    else
+        p->web = g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", display, "network-session", session,
+                              "settings", settings, "user-content-manager", content, NULL);
     creating = NULL;
     g_signal_connect(content, "script-message-received::gateMedia", G_CALLBACK(media_message), p);
     g_signal_connect(content, "script-message-with-reply-received::gateMediaListen",
@@ -1367,6 +1678,9 @@ static Page *new_page(guint id) {
     g_signal_connect(p->web, "load-failed", G_CALLBACK(failed), p);
     g_signal_connect(p->web, "web-process-terminated", G_CALLBACK(terminated), p);
     g_signal_connect(p->web, "decide-policy", G_CALLBACK(policy), p);
+    g_signal_connect(p->web, "create", G_CALLBACK(create_popup), p);
+    g_signal_connect(p->web, "close", G_CALLBACK(close_requested), p);
+    g_signal_connect(p->web, "show-notification", G_CALLBACK(show_notification), p);
     g_signal_connect(p->web, "permission-request", G_CALLBACK(permission), p);
     g_signal_connect(p->web, "script-dialog", G_CALLBACK(script_dialog), p);
     g_signal_connect(p->web, "context-menu", G_CALLBACK(context_menu), p);
@@ -1542,6 +1856,8 @@ static void command(JsonObject *o) {
         return;
     if (!strcmp(cmd, "clipboard")) {
         set_system_clipboard(wpe_display_get_clipboard(display), string(o, "text"));
+        paste_page = id;
+        paste_time = g_get_monotonic_time();
         return;
     }
     if (!strcmp(cmd, "theme")) {
@@ -1553,7 +1869,7 @@ static void command(JsonObject *o) {
     Page *p = g_hash_table_lookup(pages, GUINT_TO_POINTER(id));
     if (!strcmp(cmd, "create")) {
         if (!p)
-            new_page(id);
+            new_page(id, NULL);
         return;
     }
     if (!p)
@@ -1592,6 +1908,8 @@ static void command(JsonObject *o) {
             dismiss_questions(p);
             webkit_web_view_load_uri(p->web, url);
         }
+    } else if (!strcmp(cmd, "context")) {
+        choose_context_item(p, (int)number(o, "index"));
     } else if (!strcmp(cmd, "dismiss-menu")) {
         close_options(p);
     } else if (!strcmp(cmd, "option")) {
@@ -1608,7 +1926,19 @@ static void command(JsonObject *o) {
     } else if (!strcmp(cmd, "zoom")) {
         webkit_web_view_set_zoom_level(p->web, CLAMP(number(o, "level"), 0.25, 5));
     } else if (!strcmp(cmd, "answer")) {
+        if (p->request && WEBKIT_IS_NOTIFICATION_PERMISSION_REQUEST(p->request))
+            remember_notification_answer(p, number(o, "accept") != 0);
         answer(p, number(o, "accept") != 0, string(o, "text"));
+    } else if (!strcmp(cmd, "cancel-download")) {
+        WebKitDownload *item = downloads ? g_hash_table_lookup(downloads, (gpointer)(guintptr)number(o, "download")) : NULL;
+        if (item)
+            webkit_download_cancel(item);
+    } else if (!strcmp(cmd, "notification-clicked") || !strcmp(cmd, "notification-closed")) {
+        WebKitNotification *n = g_hash_table_lookup(p->notifications, (gpointer)(guintptr)number(o, "notification"));
+        if (n && !strcmp(cmd, "notification-clicked"))
+            webkit_notification_clicked(n);
+        else if (n)
+            webkit_notification_close(n);
     } else if (!strcmp(cmd, "media")) {
         media_command(p, string(o, "command"));
     } else if (!strcmp(cmd, "copy"))
@@ -1744,6 +2074,7 @@ static gboolean configure_storage(const char *profile) {
     } else {
         close(fd);
         session = webkit_network_session_new(data, cache);
+        notification_answers_path = g_build_filename(profile, "notification-permissions", NULL);
         webkit_website_data_manager_set_favicons_enabled(
             webkit_network_session_get_website_data_manager(session), TRUE);
         webkit_cookie_manager_set_persistent_storage(
@@ -1841,6 +2172,8 @@ int main(int argc, char **argv) {
     }
     wpe_display_set_primary(display);
     probe_gpu((ZDisplay *)display);
+    g_signal_connect(webkit_web_context_get_default(), "initialize-notification-permissions",
+                     G_CALLBACK(initialize_notification_permissions), NULL);
     if (!configure_storage(profile))
         return 1;
     configure_settings();

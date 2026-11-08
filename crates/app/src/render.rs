@@ -4,19 +4,19 @@
 use crate::activity::{self, Kind};
 use crate::chrome::{self, icon_button, icon_glyph, small_button};
 use crate::palette::Intent;
-use crate::workspace::{DRAG_THRESHOLD, DividerDrag, DropTarget, PaneDrag, SidebarDrag, Tab, Workspace};
+use crate::workspace::{DRAG_THRESHOLD, DividerDrag, DropTarget, PaneDrag, SidebarDrag, SpaceDrag, Tab, TabId, Workspace};
 use crate::theme::Ink;
 use crate::{theme, url};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, Pixels, Render, RenderImage,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Transformation, Window, deferred, div, img,
-    percentage, prelude::FluentBuilder as _, px,
+    canvas, percentage, prelude::FluentBuilder as _, px,
 };
 use layout::{Axis, Edge, PaneId, Rect};
 use std::sync::Arc;
 use std::time::Duration;
-use web::{Ask, Playback, WebView};
+use web::{Ask, DownloadState, Playback, WebView};
 
 /// How far a divider's grab area reaches into the panes on each side.
 const DIVIDER_REACH: f32 = 3.0;
@@ -33,6 +33,7 @@ impl Render for Workspace {
         let inset = self.sidebar_inset();
         let edge = inset + side;
         let area = Rect::new(edge + g, g, (vw - edge - 2.0 * g).max(0.0), (vh - 2.0 * g).max(0.0));
+        self.pane_area = area;
 
         let root = div()
             .id("workspace")
@@ -52,6 +53,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Workspace::on_forward))
             .on_action(cx.listener(Workspace::on_split_right))
             .on_action(cx.listener(Workspace::on_split_down))
+            .on_action(cx.listener(Workspace::on_new_tile))
+            .on_action(cx.listener(Workspace::on_recent_space))
+            .on_action(cx.listener(Workspace::on_recent_space_back))
             .on_action(cx.listener(Workspace::on_toggle_sidebar))
             .on_action(cx.listener(Workspace::on_next_tab))
             .on_action(cx.listener(Workspace::on_prev_tab))
@@ -125,7 +129,7 @@ impl Render for Workspace {
             .child(sidebar)
             .children(self.render_panes(area, cx));
 
-        let dragging = self.divider_drag.is_some() || self.pane_drag.is_some() || self.sidebar.drag.is_some();
+        let dragging = self.divider_drag.is_some() || self.pane_drag.is_some() || self.space_drag.is_some() || self.sidebar.drag.is_some();
         root.child(frame)
             .child(self.sidebar_resize_handle(edge, cx))
             .when(dragging, |r| r.child(self.drag_overlay(area, cx)))
@@ -181,22 +185,6 @@ fn space_tile(tab: &Tab, view: &WebView, size: f32) -> Div {
 }
 
 /// The row a dragged pane would become, shown while it is over the sidebar.
-fn new_space_row() -> impl IntoElement {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(px(10.))
-        .h(px(theme::ROW_HEIGHT))
-        .px(px(8.))
-        .rounded(px(theme::CONTROL_RADIUS))
-        .bg(theme::accent_soft())
-        .border_1()
-        .border_color(theme::accent())
-        .child(tile_base(20.0).bg(theme::wash(0.08)).child(icon_glyph("icons/plus.svg", 13.0).text_color(theme::text())))
-        .child("New space")
-}
-
 fn spinner(id: impl Into<gpui::ElementId>, size: f32, color: gpui::Rgba) -> impl IntoElement {
     icon_glyph("icons/loader.svg", size)
         .text_color(color)
@@ -281,6 +269,7 @@ impl Workspace {
             ))
             .child(
                 div()
+                    .on_children_prepainted(self.record_space_rows(0))
                     .id("spaces")
                     .flex()
                     .flex_col()
@@ -353,7 +342,12 @@ impl Workspace {
             let renaming = self.renaming.as_ref().filter(|r| r.tab == tab.id).map(|r| r.input.clone());
             let name = self.space_name(tab, cx);
             let group: SharedString = format!("space-{}", tab.id).into();
+            let held = self.space_drag.as_ref().is_some_and(|d| d.moved && d.tab == tab.id);
+            let gap = self.dropping_new_space();
             let row = div()
+                .relative()
+                .when(gap == Some(i), |r| r.child(drop_line(true)))
+                .when(gap == Some(self.tabs.len()) && i + 1 == self.tabs.len(), |r| r.child(drop_line(false)))
                 .id(("space", tab.id))
                 .group(group.clone())
                 .flex()
@@ -366,6 +360,9 @@ impl Workspace {
                 .rounded(px(theme::CONTROL_RADIUS))
                 .when(active, |r| r.bg(ink.selected))
                 .when(!active, |r| r.hover(move |s| s.bg(ink.hover)))
+                // Where Ctrl+Tab would go, while Ctrl is held.
+                .when(self.switching_to() == Some(tab.id), |r| r.bg(theme::accent_soft()))
+                .when(held, |r| r.opacity(0.5))
                 .child(space_tile(tab, view, 20.0))
                 .child(match renaming {
                     Some(input) => div()
@@ -383,6 +380,7 @@ impl Workspace {
                         .child(input),
                     None => div().flex_1().min_w_0().truncate().child(name),
                 })
+                .when(tab.unvisited, |r| r.child(unvisited_dot().mr(px(4.))))
                 .when(view.is_loading(), |r| r.child(spinner(("space-loading", tab.id), 12.0, theme::working())))
                 .when(count > 1, |r| {
                     r.child(
@@ -401,25 +399,177 @@ impl Workspace {
                         .on_click(cx.listener(move |this, _, w, cx| this.close_tab(i, w, cx))),
                 )
                 .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, w, cx| this.close_tab(i, w, cx)))
-                // Double-click (or F2) renames.
-                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, w, cx| {
-                    if ev.click_count() >= 2 {
-                        this.start_rename(i, w, cx);
-                    } else {
-                        this.activate(i, w, cx);
-                    }
-                }));
+                // A click opens it, a double-click (or F2) renames it, a drag
+                // onto a pane's side splits it in there (see `drag_end`).
+                .on_mouse_down(MouseButton::Left, cx.listener(hold_space(tab.id)));
             rows.push(row.into_any_element());
-        }
-        if self.dropping_new_space() {
-            rows.push(new_space_row().into_any_element());
         }
         rows
     }
 
-    /// A pane is being dragged over the sidebar, to become a space.
-    fn dropping_new_space(&self) -> bool {
-        self.pane_drag.as_ref().is_some_and(|d| d.moved && d.target == Some(DropTarget::NewSpace))
+    /// The space Ctrl+Tab would go to, while Ctrl is held.
+    fn switching_to(&self) -> Option<TabId> {
+        self.switching.as_ref().map(|s| s.order[s.at])
+    }
+
+    /// Where in the list a pane dragged over the sidebar would become a
+    /// space.
+    fn dropping_new_space(&self) -> Option<usize> {
+        self.pane_drag.as_ref().filter(|d| d.moved).and_then(|d| match d.target {
+            Some(DropTarget::NewSpace(at)) => Some(at),
+            _ => None,
+        })
+    }
+
+    /// Stores where the spaces' rows were laid out (see `space_rows`); the
+    /// list's first `skip` children aren't spaces.
+    fn record_space_rows(&self, skip: usize) -> impl Fn(Vec<gpui::Bounds<Pixels>>, &mut Window, &mut gpui::App) + 'static {
+        let shown: Vec<usize> = (0..self.tabs.len()).filter(|i| self.panes.contains_key(&self.tabs[*i].focused)).collect();
+        let rows = self.space_rows.clone();
+        move |bounds, _, _| *rows.borrow_mut() = shown.iter().copied().zip(bounds.into_iter().skip(skip)).collect()
+    }
+
+    /// The gap in the spaces list nearest `y`, as a place in `tabs`.
+    fn space_gap(&self, y: Pixels) -> usize {
+        let rows = self.space_rows.borrow();
+        rows.iter().find(|(_, b)| y < b.center().y).map_or(self.tabs.len(), |(i, _)| *i)
+    }
+
+    /// Activity's Downloads and Notifications (see [`crate::notices`]).
+    fn notice_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let ink = self.ink;
+        let mut rows = Vec::new();
+        let heading = |label: &'static str, count: usize| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .h(px(26.))
+                .px(px(8.))
+                .mt(px(4.))
+                .text_size(px(12.))
+                .child(div().text_color(theme::accent()).child(label))
+                .child(div().text_color(ink.dim).child(count.to_string()))
+                .into_any_element()
+        };
+        if !self.downloads.is_empty() {
+            rows.push(heading("Downloads", self.downloads.len()));
+            // Running first, then the rest, newest first in each.
+            let mut order: Vec<usize> = (0..self.downloads.len()).collect();
+            order.sort_by_key(|&i| self.downloads[i].download.state != DownloadState::Running);
+            for i in order {
+                let download = &self.downloads[i].download;
+                let group: SharedString = format!("download-{i}").into();
+                let done = download.state == DownloadState::Done;
+                rows.push(
+                    div()
+                        .id(("download", i))
+                        .group(group.clone())
+                        .relative()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(10.))
+                        .h(px(theme::ROW_HEIGHT))
+                        .px(px(8.))
+                        .rounded(px(theme::CONTROL_RADIUS))
+                        .hover(move |s| s.bg(ink.hover))
+                        .child(download_tile(download, 20.0))
+                        .child(div().flex_1().min_w_0().truncate().child(download.name.clone()))
+                        // The status; under the pointer, the buttons over it
+                        // (hover changes no layout).
+                        .child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(ink.dim)
+                                .group_hover(group.clone(), |s| s.invisible())
+                                .child(download_status(download)),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(6.))
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .pl(px(4.))
+                                .invisible()
+                                .group_hover(group.clone(), move |s| s.visible().bg(ink.hover))
+                                .when(done, |buttons| {
+                                    buttons.child(
+                                        small_button(("download-folder", i), format!("download-folder-{i}"), "icons/folder.svg", ink)
+                                            .on_click(cx.listener(move |this, _, _, cx| this.show_download(i, cx))),
+                                    )
+                                })
+                                .child(
+                                    small_button(("download-close", i), format!("download-close-{i}"), "icons/x.svg", ink)
+                                        .on_click(cx.listener(move |this, _, _, cx| this.close_download(i, cx))),
+                                ),
+                        )
+                        .when(done, |row| row.on_click(cx.listener(move |this, _, _, cx| this.open_download(i, cx))))
+                        .into_any_element(),
+                );
+            }
+        }
+        if !self.notes.is_empty() {
+            rows.push(heading("Notifications", self.notes.len()));
+            for (i, item) in self.notes.iter().enumerate() {
+                let group: SharedString = format!("note-{i}").into();
+                let tile = match self.panes.get(&item.pane).map(|p| p.view.read(cx)) {
+                    Some(view) => site_tile(view.favicon(), view.url(), 20.0),
+                    None => tile_base(20.0).bg(theme::wash(0.06)).child(icon_glyph("icons/bell.svg", 13.0)),
+                };
+                rows.push(
+                    div()
+                        .id(("note", i))
+                        .group(group.clone())
+                        .relative()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(10.))
+                        .h(px(theme::ROW_HEIGHT))
+                        .px(px(8.))
+                        .rounded(px(theme::CONTROL_RADIUS))
+                        .hover(move |s| s.bg(ink.hover))
+                        .child(tile)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(px(6.))
+                                .overflow_hidden()
+                                .child(div().flex_none().max_w(gpui::relative(0.6)).truncate().child(item.note.title.clone()))
+                                .child(div().flex_1().min_w_0().truncate().text_color(ink.dim).child(item.note.body.clone())),
+                        )
+                        // Over the text's end, under the pointer (no layout change).
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(6.))
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .pl(px(4.))
+                                .invisible()
+                                .group_hover(group.clone(), move |s| s.visible().bg(ink.hover))
+                                .child(
+                                    small_button(("note-close", i), format!("note-close-{i}"), "icons/x.svg", ink)
+                                        .on_click(cx.listener(move |this, _, _, cx| this.close_note(i, cx))),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, w, cx| this.open_note(i, w, cx)))
+                        .into_any_element(),
+                );
+            }
+        }
+        rows
     }
 
     fn activity_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -427,7 +577,7 @@ impl Workspace {
         let items = activity::items(self, cx);
         // Not a page's: the browser's own (a downloaded update).
         let update = self.store.ublock_update.ready.clone();
-        if items.is_empty() && update.is_none() {
+        if items.is_empty() && update.is_none() && self.downloads.is_empty() && self.notes.is_empty() {
             return vec![
                 div()
                     .px(px(8.))
@@ -440,6 +590,10 @@ impl Workspace {
         }
         let mut rows = Vec::new();
         for kind in Kind::ALL {
+            // Downloads and notifications come after what's live.
+            if kind == Kind::Media {
+                rows.extend(self.notice_rows(cx));
+            }
             let group: Vec<_> = items.iter().filter(|i| i.kind == kind).collect();
             let notices = if kind == Kind::NeedsYou { update.iter().count() } else { 0 };
             if group.is_empty() && notices == 0 {
@@ -556,10 +710,18 @@ impl Workspace {
         let mut spaces = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
             let Some(view) = self.panes.get(&tab.focused).map(|p| p.view.read(cx)) else { continue };
+            let held = self.space_drag.as_ref().is_some_and(|d| d.moved && d.tab == tab.id);
+            let tile = space_tile(tab, view, 20.0).relative().when(tab.unvisited, |t| {
+                t.child(unvisited_dot().absolute().right(px(-3.)).top(px(-3.)).border_2().border_color(theme::chrome()).size(px(9.)))
+            });
             spaces.push(
-                rail_item(("rail-space", tab.id), i == self.active, space_tile(tab, view, 20.0), ink)
+                rail_item(("rail-space", tab.id), i == self.active, tile, ink)
+                    .when(self.switching_to() == Some(tab.id), |r| r.bg(theme::accent_soft()))
+                    .when(held, |r| r.opacity(0.5))
+                    .when(self.dropping_new_space() == Some(i), |r| r.child(drop_line(true)))
+                    .when(self.dropping_new_space() == Some(self.tabs.len()) && i + 1 == self.tabs.len(), |r| r.child(drop_line(false)))
                     .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, w, cx| this.close_tab(i, w, cx)))
-                    .on_click(cx.listener(move |this, _, w, cx| this.activate(i, w, cx)))
+                    .on_mouse_down(MouseButton::Left, cx.listener(hold_space(tab.id)))
                     .into_any_element(),
             );
         }
@@ -570,6 +732,22 @@ impl Workspace {
             activity.push(
                 rail_item("rail-ublock-update", false, update_tile(20.0).relative().child(status_dot(Kind::NeedsYou)), ink)
                     .on_click(cx.listener(|this, _, w, cx| this.open_settings(crate::workspace::SettingsSection::AdBlocking, w, cx)))
+                    .into_any_element(),
+            );
+        }
+        for (i, item) in self.downloads.iter().enumerate() {
+            activity.push(
+                rail_item(("rail-download", i), false, download_tile(&item.download, 20.0), ink)
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_download(i, cx)))
+                    .into_any_element(),
+            );
+        }
+        for (i, item) in self.notes.iter().enumerate() {
+            let Some(view) = self.panes.get(&item.pane).map(|p| p.view.read(cx)) else { continue };
+            let tile = site_tile(view.favicon(), view.url(), 20.0).relative().child(unvisited_dot().absolute().right(px(-3.)).top(px(-3.)).border_2().border_color(theme::chrome()).size(px(9.)));
+            activity.push(
+                rail_item(("rail-note", i), false, tile, ink)
+                    .on_click(cx.listener(move |this, _, w, cx| this.open_note(i, w, cx)))
                     .into_any_element(),
             );
         }
@@ -592,6 +770,7 @@ impl Workspace {
             .child(top)
             .child(
                 div()
+                    .on_children_prepainted(self.record_space_rows(1))
                     .id("rail-spaces")
                     .flex()
                     .flex_col()
@@ -604,22 +783,7 @@ impl Workspace {
                         icon_button("rail-new-tab", "icons/plus.svg", ink)
                             .on_click(cx.listener(|this, _, w, cx| this.on_new_tab(&crate::workspace::NewTab, w, cx))),
                     )
-                    .children(spaces)
-                    .when(self.dropping_new_space(), |list| {
-                        list.child(
-                            div()
-                                .flex()
-                                .flex_none()
-                                .items_center()
-                                .justify_center()
-                                .size(px(32.))
-                                .rounded(px(theme::CONTROL_RADIUS))
-                                .bg(theme::accent_soft())
-                                .border_1()
-                                .border_color(theme::accent())
-                                .child(icon_glyph("icons/plus.svg", 14.0).text_color(ink.text)),
-                        )
-                    }),
+                    .children(spaces),
             )
             .child(
                 div()
@@ -847,12 +1011,18 @@ impl Workspace {
             Some(DropTarget::Pane(target, edge)) if target == pane => Some(edge),
             _ => None,
         });
+        // Where a space dragged from the sidebar would go.
+        let drop = drop.or_else(|| {
+            self.space_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target).filter(|(t, _)| *t == pane).map(|(_, edge)| Some(edge))
+        });
         // Where the split the palette asks about would go.
         let drop = drop.or_else(|| match self.palette.as_ref().map(|p| p.intent) {
             Some(Intent::Split { target, edge }) if target == pane => Some(Some(edge)),
             _ => None,
         });
 
+        // The pane held by its header, once it moves: shaded where it was.
+        let lifted = self.pane_drag.as_ref().is_some_and(|d| d.moved && d.pane == pane);
         div()
             .id(("pane", pane))
             .absolute()
@@ -873,7 +1043,56 @@ impl Workspace {
             .when(asks, |card| card.child(deferred(self.question(pane, rect, cx))))
             .child(ring)
             .when_some(drop, |card, edge| card.child(deferred(drop_highlight(rect, edge))))
+            .when(lifted, |card| card.child(deferred(lifted_shade())))
+            .children(self.page_menu(pane, cx))
             .into_any_element()
+    }
+
+    /// The page's right-click menu, where it was asked for (see
+    /// `web::WebView::context_menu`).
+    fn page_menu(&self, pane: PaneId, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let view = self.panes.get(&pane)?.view.clone();
+        let menu = view.read(cx).context_menu()?.clone();
+        let rows = menu.items.into_iter().enumerate().map(|(index, item)| match item {
+            web::ContextMenuItem::Separator => div().h(px(1.)).my(px(4.)).mx(px(6.)).bg(theme::border()).into_any_element(),
+            web::ContextMenuItem::Command { label, enabled } => {
+                let view = view.clone();
+                div()
+                    .id(("page-menu", index))
+                    .flex()
+                    .items_center()
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(5.))
+                    .text_size(px(12.5))
+                    .text_color(if enabled { theme::text() } else { theme::text_dim() })
+                    .when(enabled, |d| {
+                        d.hover(|s| s.bg(theme::hover())).on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            cx.stop_propagation();
+                            view.update(cx, |v, cx| v.choose_context(Some(index), cx));
+                        })
+                    })
+                    .child(label)
+                    .into_any_element()
+            }
+        });
+        let card = div()
+            .flex()
+            .flex_col()
+            .min_w(px(200.))
+            .p(px(4.))
+            .rounded(px(8.))
+            .bg(theme::popover())
+            .border_1()
+            .border_color(theme::border())
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out({
+                let view = view.clone();
+                move |_, _, cx| view.update(cx, |v, cx| v.choose_context(None, cx))
+            })
+            .children(rows);
+        Some(deferred(gpui::anchored().position(menu.at).snap_to_window_with_margin(px(8.)).child(card)).with_priority(3).into_any_element())
     }
 
     /// The question a pane's page asks (or its crash), over the page.
@@ -986,12 +1205,13 @@ impl Workspace {
             .occlude()
             .when(cursor_row, |el| el.cursor_row_resize())
             .when(cursor_col, |el| el.cursor_col_resize())
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| this.drag_move(ev.position, area, cx)))
+            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| this.drag_move(ev.position, ev.modifiers.shift, area, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, w, cx| this.drag_end(ev.position, w, cx)))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, ev: &MouseUpEvent, w, cx| this.drag_end(ev.position, w, cx)))
     }
 
-    fn drag_move(&mut self, pos: gpui::Point<Pixels>, area: Rect, cx: &mut Context<Self>) {
+    /// `swap`: Shift is held, so a dragged pane swaps with the one under it.
+    fn drag_move(&mut self, pos: gpui::Point<Pixels>, swap: bool, area: Rect, cx: &mut Context<Self>) {
         match self.sidebar.drag {
             Some(SidebarDrag::Width { offset }) => {
                 return self.drag_sidebar_edge(f32::from(pos.x) - offset - self.sidebar_inset(), cx);
@@ -1016,6 +1236,31 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if let Some(drag) = self.space_drag.as_ref() {
+            let (dx, dy) = (f32::from(pos.x - drag.origin.x), f32::from(pos.y - drag.origin.y));
+            if !drag.moved && dx.hypot(dy) < DRAG_THRESHOLD {
+                return;
+            }
+            let (x, y) = (f32::from(pos.x), f32::from(pos.y));
+            // Beside a pane of the space shown (not the one dragged).
+            let held = drag.tab;
+            let target = self.tabs.get(self.active).filter(|t| t.id != held).and_then(|tab| {
+                let panes = match tab.zoomed {
+                    Some(pane) => vec![(pane, area)],
+                    None => tab.root.geometry(area, theme::GAP).panes,
+                };
+                panes.into_iter().find_map(|(p, r)| match layout::drop_zone(r, x, y) {
+                    Some(Some(edge)) => Some((p, edge)),
+                    _ => None,
+                })
+            });
+            if let Some(drag) = self.space_drag.as_mut() {
+                drag.moved = true;
+                drag.target = target;
+            }
+            cx.notify();
+            return;
+        }
         if let Some(drag) = self.pane_drag.as_mut() {
             let (dx, dy) = (f32::from(pos.x - drag.origin.x), f32::from(pos.y - drag.origin.y));
             if !drag.moved && dx.hypot(dy) < DRAG_THRESHOLD {
@@ -1024,14 +1269,14 @@ impl Workspace {
             drag.moved = true;
             let (x, y) = (f32::from(pos.x), f32::from(pos.y));
             let target = if x < self.sidebar_inset() + self.sidebar_width() {
-                Some(DropTarget::NewSpace)
+                Some(DropTarget::NewSpace(self.space_gap(pos.y)))
             } else {
                 self.tabs.get(self.active).and_then(|tab| {
                     tab.root
                         .geometry(area, theme::GAP)
                         .panes
                         .iter()
-                        .find_map(|(p, r)| layout::drop_zone(*r, x, y).map(|zone| DropTarget::Pane(*p, zone)))
+                        .find_map(|(p, r)| layout::drop_zone(*r, x, y).map(|zone| DropTarget::Pane(*p, if swap { None } else { zone })))
                 })
             };
             if let Some(drag) = self.pane_drag.as_mut() {
@@ -1044,18 +1289,45 @@ impl Workspace {
     fn drag_end(&mut self, _pos: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar.drag = None;
         self.divider_drag = None;
+        if let Some(drag) = self.space_drag.take() {
+            let index = self.tabs.iter().position(|t| t.id == drag.tab);
+            match (drag.moved, drag.target, index) {
+                (false, _, Some(i)) if drag.clicks >= 2 => self.start_rename(i, window, cx),
+                (false, _, Some(i)) => self.activate(i, window, cx),
+                (true, Some((target, edge)), _) => self.space_beside(drag.tab, target, edge, window, cx),
+                _ => {}
+            }
+        }
         if let Some(drag) = self.pane_drag.take().filter(|d| d.moved) {
             match drag.target {
                 Some(DropTarget::Pane(target, edge)) if target != drag.pane => {
                     self.move_pane(drag.pane, target, edge, cx);
                     self.focus_pane(drag.pane, window, cx);
                 }
-                Some(DropTarget::NewSpace) => self.pane_to_new_space(drag.pane, window, cx),
+                Some(DropTarget::NewSpace(at)) => self.pane_to_new_space(drag.pane, at, window, cx),
                 _ => {}
             }
         }
         cx.notify();
     }
+}
+
+/// A press on a space's sidebar entry: a click or a drag, which
+/// [`Workspace::drag_end`] tells apart.
+fn hold_space(tab: TabId) -> impl Fn(&mut Workspace, &MouseDownEvent, &mut Window, &mut Context<Workspace>) + 'static {
+    move |this, ev, _, cx| {
+        // Clicks in its name field while renaming it stay there.
+        if this.renaming.as_ref().is_some_and(|r| r.tab == tab) {
+            return;
+        }
+        this.space_drag = Some(SpaceDrag { tab, origin: ev.position, clicks: ev.click_count, moved: false, target: None });
+        cx.notify();
+    }
+}
+
+/// Marks a space opened in the background and not looked at yet.
+fn unvisited_dot() -> Div {
+    div().flex_none().size(px(7.)).rounded_full().bg(theme::accent())
 }
 
 fn section_header(label: &'static str, action: Option<AnyElement>, ink: Ink) -> impl IntoElement {
@@ -1076,6 +1348,7 @@ fn section_header(label: &'static str, action: Option<AnyElement>, ink: Ink) -> 
 fn rail_item(id: impl Into<gpui::ElementId>, active: bool, tile: Div, ink: Ink) -> Stateful<Div> {
     div()
         .id(id)
+        .relative()
         .flex()
         .flex_none()
         .items_center()
@@ -1122,6 +1395,86 @@ fn status_dot(kind: Kind) -> Div {
 }
 
 /// The ad blocker's tile (its updates in Activity).
+/// A download's icon: its progress as a ring around it while it runs.
+fn download_tile(download: &web::Download, size: f32) -> Div {
+    let tile = tile_base(size).relative().bg(theme::wash(0.06));
+    match &download.state {
+        DownloadState::Running => {
+            let fraction = download.total.map(|t| (download.received as f32 / t as f32).clamp(0.0, 1.0));
+            tile.child(icon_glyph("icons/download.svg", size * 0.55).text_color(theme::text()))
+                .child(div().absolute().inset_0().child(progress_ring(size, fraction)))
+        }
+        DownloadState::Done => tile.child(icon_glyph("icons/download.svg", size * 0.6).text_color(theme::accent())),
+        DownloadState::Cancelled => tile.child(icon_glyph("icons/x.svg", size * 0.6).text_color(theme::text_dim())),
+        DownloadState::Failed(_) => tile.child(icon_glyph("icons/circle-alert.svg", size * 0.65).text_color(theme::needs_you())),
+    }
+}
+
+/// A ring filled clockwise from the top to `fraction`; with no fraction
+/// known, a short arc that turns.
+fn progress_ring(size: f32, fraction: Option<f32>) -> AnyElement {
+    let ring = move |turn: f32, fraction: f32| {
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let center = bounds.center();
+                let radius = bounds.size.width.min(bounds.size.height) / 2.0 - px(1.25);
+                let at = |angle: f32| gpui::point(center.x + radius * angle.sin(), center.y - radius * angle.cos());
+                let arc = |from: f32, to: f32, color: gpui::Hsla, window: &mut Window| {
+                    let mut path = gpui::PathBuilder::stroke(px(1.75));
+                    path.move_to(at(from));
+                    // Halves, so a whole ring is two arcs.
+                    let mid = (from + to) / 2.0;
+                    for (a, b) in [(from, mid), (mid, to)] {
+                        path.arc_to(gpui::point(radius, radius), px(0.), b - a > std::f32::consts::PI, true, at(b));
+                    }
+                    if let Ok(path) = path.build() {
+                        window.paint_path(path, color);
+                    }
+                };
+                let tau = std::f32::consts::TAU;
+                arc(0.0, tau - 0.001, theme::wash(0.14), window);
+                if fraction > 0.0 {
+                    arc(turn * tau, (turn + fraction) * tau, theme::accent().into(), window);
+                }
+            },
+        )
+        .size(px(size))
+    };
+    match fraction {
+        Some(fraction) => ring(0.0, fraction).into_any_element(),
+        None => div()
+            .size(px(size))
+            .with_animation("download-turn", Animation::new(Duration::from_millis(1200)).repeat(), move |d, delta| {
+                d.child(ring(delta, 0.25))
+            })
+            .into_any_element(),
+    }
+}
+
+/// "12 of 40 MB", "Done", ….
+fn download_status(download: &web::Download) -> String {
+    match &download.state {
+        DownloadState::Running => match download.total {
+            Some(total) => format!("{} of {}", bytes(download.received), bytes(total)),
+            None => bytes(download.received),
+        },
+        DownloadState::Done => bytes(download.total.unwrap_or(download.received)),
+        DownloadState::Cancelled => "Cancelled".to_string(),
+        DownloadState::Failed(_) => "Failed".to_string(),
+    }
+}
+
+fn bytes(n: u64) -> String {
+    let n = n as f64;
+    match n {
+        n if n >= 1e9 => format!("{:.1} GB", n / 1e9),
+        n if n >= 1e6 => format!("{:.1} MB", n / 1e6),
+        n if n >= 1e3 => format!("{:.0} KB", n / 1e3),
+        n => format!("{n} B"),
+    }
+}
+
 fn update_tile(size: f32) -> Div {
     tile_base(size).bg(theme::wash(0.06)).child(icon_glyph("icons/shield.svg", size * 0.65).text_color(theme::needs_you()))
 }
@@ -1195,6 +1548,32 @@ fn join_words(words: &[&str]) -> String {
 
 /// Where a dropped pane would land: half the target on an edge, all of it
 /// (a swap) in the middle.
+/// Where a dragged pane would land in the spaces list: a line across the
+/// gap above (or below) a row, over the gap so nothing moves.
+fn drop_line(above: bool) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(2.))
+        .right(px(2.))
+        .h(px(2.))
+        .when(above, |d| d.top(px(-2.)))
+        .when(!above, |d| d.bottom(px(-2.)))
+        .rounded(px(1.))
+        .bg(theme::accent())
+}
+
+/// Over a pane being dragged: faded, edged in the accent.
+fn lifted_shade() -> impl IntoElement {
+    let surface = theme::surface();
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(theme::PANE_RADIUS))
+        .bg(gpui::Rgba { a: 0.55, ..surface })
+        .border_2()
+        .border_color(theme::accent())
+}
+
 fn drop_highlight(rect: Rect, edge: Option<Edge>) -> impl IntoElement {
     let (w, h) = (rect.w, rect.h);
     let (x, y, dw, dh) = match edge {

@@ -35,10 +35,12 @@ jobs:
             libjpeg-dev liblcms2-dev libpng-dev libsoup-3.0-dev libsqlite3-dev \
             libtasn1-6-dev libwebp-dev libwoff2-dev libxml2-dev libxslt1-dev zlib1g-dev \
             libegl-dev libgles-dev libjson-glib-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+            flex bison liborc-0.4-dev libopus-dev libvpx-dev libsrtp2-dev libnice-dev
+          # GStreamer (built with WebKit) needs a newer meson than Ubuntu's.
+          pipx install meson
 
-      # The install, by what the build depends on: xtask/src/wpe.rs (version,
-      # options) and the patches.
+      # The install (WebKit and GStreamer), by what the build depends on:
+      # xtask/src/wpe.rs (versions, options) and the patches.
       - name: Restore WPE WebKit
         id: wpe
         uses: actions/cache/restore@v4

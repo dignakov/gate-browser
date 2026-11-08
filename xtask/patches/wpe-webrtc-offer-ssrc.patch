@@ -1,0 +1,64 @@
+WebRTC offers carry each sender's SSRC (a=ssrc, and the RTX ssrc-group:FID
+for video) before a track is attached, as libwebrtc's do; Google Meet
+requires them. The packetizers send with the SSRC the offer announced.
+
+--- a/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
++++ b/Source/WebCore/Modules/mediastream/gstreamer/GStreamerMediaEndpoint.cpp
+@@ -1845,6 +1845,18 @@
+     GST_DEBUG_OBJECT(m_pipeline.get(), "Adding %s transceiver for payload %" GST_PTR_FORMAT, desc.utf8(), caps.get());
+ #endif
+ 
++    // A sender's SSRC is part of the offer from the start, track or not, as with libwebrtc:
++    // webrtcbin signals a=ssrc (and, for video, the RTX ssrc-group:FID) only for caps carrying
++    // one. The packetizers send with it once a track is attached.
++    if (direction == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV || direction == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY) {
++        auto ssrc = m_ssrcGenerator->generateSSRC();
++        if (ssrc != std::numeric_limits<uint32_t>::max()) {
++            caps = adoptGRef(gst_caps_make_writable(caps.leakRef()));
++            for (unsigned i = 0; i < gst_caps_get_size(caps.get()); i++)
++                gst_structure_set(gst_caps_get_structure(caps.get(), i), "ssrc", G_TYPE_UINT, ssrc, nullptr);
++        }
++    }
++
+     // FIXME: None of this (excepted direction) is passed to webrtcbin yet.
+     GUniquePtr<GstStructure> initData(gst_structure_new("transceiver-init-data", "direction", GST_TYPE_WEBRTC_RTP_TRANSCEIVER_DIRECTION, direction, nullptr));
+ 
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerAudioRTPPacketizer.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerAudioRTPPacketizer.cpp
+@@ -62,9 +62,13 @@
+     GRefPtr inputCaps = adoptGRef(gst_caps_new_any());
+     GUniquePtr<GstStructure> structure(gst_structure_copy(codecParameters));
+ 
+-    auto ssrc = ssrcGenerator->generateSSRC();
+-    if (ssrc != std::numeric_limits<uint32_t>::max())
+-        gst_structure_set(structure.get(), "ssrc", G_TYPE_UINT, ssrc, nullptr);
++    // The SSRC the offer announced (see GStreamerMediaEndpoint::createTransceiverBackends) is
++    // the one sent with.
++    if (!gst_structure_has_field(structure.get(), "ssrc")) {
++        auto ssrc = ssrcGenerator->generateSSRC();
++        if (ssrc != std::numeric_limits<uint32_t>::max())
++            gst_structure_set(structure.get(), "ssrc", G_TYPE_UINT, ssrc, nullptr);
++    }
+ 
+     GRefPtr<GstElement> encoder;
+     if (encoding == "opus"_s) {
+--- a/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoRTPPacketizer.cpp
++++ b/Source/WebCore/platform/mediastream/gstreamer/GStreamerVideoRTPPacketizer.cpp
+@@ -139,9 +139,14 @@
+         return nullptr;
+     }
+ 
+-    auto ssrc = ssrcGenerator->generateSSRC();
+-    if (ssrc != std::numeric_limits<uint32_t>::max())
+-        gst_structure_set(codecParameters.get(), "ssrc", G_TYPE_UINT, ssrc, nullptr);
++    // The SSRC the offer announced (see GStreamerMediaEndpoint::createTransceiverBackends) is
++    // the one sent with; each simulcast layer has its own.
++    bool isLayer = encodingParameters && gst_structure_has_field(encodingParameters.get(), "rid");
++    if (isLayer || !gst_structure_has_field(codecParameters.get(), "ssrc")) {
++        auto ssrc = ssrcGenerator->generateSSRC();
++        if (ssrc != std::numeric_limits<uint32_t>::max())
++            gst_structure_set(codecParameters.get(), "ssrc", G_TYPE_UINT, ssrc, nullptr);
++    }
+ 
+     GRefPtr rtpCaps = adoptGRef(gst_caps_new_empty());
+     gst_caps_append_structure(rtpCaps.get(), codecParameters.release());

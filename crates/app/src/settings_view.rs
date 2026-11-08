@@ -53,6 +53,7 @@ impl Workspace {
 
         let page = match section {
             SettingsSection::Look => self.look_page(cx),
+            SettingsSection::Tiling => self.tiling_page(cx),
             SettingsSection::AdBlocking => self.ad_blocking_page(cx),
         };
 
@@ -91,6 +92,46 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_settings(w, cx)))
             .child(card)
             .children(self.slider_overlay(cx))
+    }
+
+    fn tiling_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let spiral = self.store.settings.tiling_spiral;
+        let spiral_toggle = toggle("settings-tiling-spiral", spiral, true).on_click(cx.listener(|this, _, _, cx| {
+            this.store.set(|s| s.tiling_spiral = !s.tiling_spiral);
+            cx.notify();
+        }));
+        div()
+            .flex()
+            .flex_col()
+            .child(heading("Tiling"))
+            .child(row(
+                "Open links as tiles",
+                Some(
+                    "Middle-click and Ctrl+click open a link beside the page, in a spiral: right, then below, then left, \
+                     then above, turning inward. Hold Shift for a space instead. Off, they open as spaces, and Shift makes \
+                     a tile."
+                        .to_string(),
+                ),
+                false,
+                spiral_toggle.into_any_element(),
+            ))
+            .child(row(
+                "New tile",
+                Some(
+                    "Ctrl+Alt+Enter opens a page beside this one: in the spiral when it's on, otherwise across the \
+                     pane's longer side. Too small to split, it opens as a space."
+                        .to_string(),
+                ),
+                false,
+                div().into_any_element(),
+            ))
+            .child(row(
+                "Swap panes",
+                Some("Hold Shift while dragging a pane by its header to swap it with the one it's dropped on.".to_string()),
+                false,
+                div().into_any_element(),
+            ))
+            .into_any_element()
     }
 
     fn ad_blocking_page(&mut self, cx: &mut Context<Self>) -> AnyElement {

@@ -1,7 +1,7 @@
 //! [`WebView`]: one page as a GPUI view, on whichever engine renders it. It
 //! keeps what the page reported, forwards input, and has the engine paint.
 
-use crate::engine::{self, Button, Input, Menu, Page, PageEvent};
+use crate::engine::{self, Button, Input, Menu, Page, PageEvent, Popup};
 use crate::{Ask, Playback, Zoom};
 use gpui::{
     App, Bounds, Context, Corners, CursorStyle, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
@@ -26,7 +26,18 @@ pub enum WebEvent {
     Progress(f64),
     Fullscreen(bool),
     /// The page asked for a new window; we open it as a tab.
-    OpenTab { url: String, background: bool },
+    /// `alternate`: Shift was held, for the other of a space and a tile.
+    OpenTab { url: String, background: bool, alternate: bool },
+    /// The page opened a window it keeps a hold of: take it with
+    /// [`WebView::take_popups`] and show it.
+    Popup,
+    /// The page's script closed its window (`window.close()`).
+    CloseRequested,
+    Download(crate::Download),
+    Notification(crate::Notification),
+    NotificationClosed(u64),
+    /// The page's right-click menu opened (see [`WebView::context_menu`]).
+    ContextMenu,
     /// A question appeared or went away (see [`WebView::ask`]).
     Ask,
     /// The page started or stopped using the camera or microphone.
@@ -70,9 +81,13 @@ pub struct WebView {
     muted: bool,
     /// A select's options, open over the page.
     menu: Option<Menu>,
+    /// The page's right-click menu, for the app to draw.
+    context_menu: Option<crate::ContextMenu>,
     /// Rounds the page's corners (where the pane's card is rounded).
     corners: Corners<Pixels>,
     closed: bool,
+    /// Windows the page opened, until the app takes them.
+    popups: Vec<Popup>,
 }
 
 impl EventEmitter<WebEvent> for WebView {}
@@ -103,6 +118,20 @@ impl WebView {
         view
     }
 
+    /// A window a page opened (see [`WebEvent::Popup`]): the engine's page,
+    /// already loading what the opener asked for.
+    pub fn popup(popup: Popup, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let Popup { events, receiver, page } = popup;
+        let mut view = Self::with_channel("", events, receiver, window, cx);
+        view.page = engine::adopt(page);
+        view
+    }
+
+    /// The windows the page opened since last asked.
+    pub fn take_popups(&mut self) -> Vec<Popup> {
+        std::mem::take(&mut self.popups)
+    }
+
     /// Restored, and not opened since.
     pub fn is_asleep(&self) -> bool {
         self.page.is_none() && !self.closed
@@ -110,6 +139,16 @@ impl WebView {
 
     fn empty(url: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (events, receiver) = async_channel::unbounded();
+        Self::with_channel(url, events, receiver, window, cx)
+    }
+
+    fn with_channel(
+        url: &str,
+        events: engine::Events,
+        receiver: async_channel::Receiver<PageEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // What the engine reports, in order, a batch at a time.
         cx.spawn(async move |this, cx| {
             while let Ok(first) = receiver.recv().await {
@@ -165,8 +204,10 @@ impl WebView {
             playback: Playback::None,
             muted: false,
             menu: None,
+            context_menu: None,
             corners: Corners::default(),
             closed: false,
+            popups: Vec::new(),
         }
     }
 
@@ -288,6 +329,26 @@ impl WebView {
     pub fn show_dev_tools(&mut self) {
         self.with_page(|p| p.show_dev_tools());
     }
+    /// The page's right-click menu, open until chosen from or closed.
+    pub fn context_menu(&self) -> Option<&crate::ContextMenu> {
+        self.context_menu.as_ref()
+    }
+    /// Runs the right-click menu's item at `index`, or closes the menu.
+    pub fn choose_context(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            self.with_page(|p| p.choose_context(index));
+            cx.notify();
+        }
+    }
+    pub fn cancel_download(&mut self, id: u64) {
+        self.with_page(|p| p.cancel_download(id));
+    }
+    pub fn notification_clicked(&mut self, id: u64) {
+        self.with_page(|p| p.notification_clicked(id));
+    }
+    pub fn notification_closed(&mut self, id: u64) {
+        self.with_page(|p| p.notification_closed(id));
+    }
 
     /// A page that is not shown stops rendering (and its timers slow down).
     /// A sleeping page wakes when first shown (on its next paint).
@@ -358,7 +419,21 @@ impl WebView {
                     Some(WebEvent::Progress(p))
                 }
                 PageEvent::Fullscreen(f) => Some(WebEvent::Fullscreen(f)),
-                PageEvent::OpenTab { url, background } => Some(WebEvent::OpenTab { url, background }),
+                PageEvent::OpenTab { url, background, alternate } => Some(WebEvent::OpenTab { url, background, alternate }),
+                PageEvent::Popup(popup) => {
+                    self.popups.push(popup);
+                    Some(WebEvent::Popup)
+                }
+                PageEvent::CloseRequested => Some(WebEvent::CloseRequested),
+                PageEvent::Download(download) => Some(WebEvent::Download(download)),
+                PageEvent::Notification(notification) => Some(WebEvent::Notification(notification)),
+                PageEvent::NotificationClosed(id) => Some(WebEvent::NotificationClosed(id)),
+                PageEvent::ContextMenu(mut menu) => {
+                    let origin = self.bounds.get().origin;
+                    menu.at = origin + menu.at;
+                    self.context_menu = Some(menu);
+                    Some(WebEvent::ContextMenu)
+                }
                 PageEvent::Ask(ask) => {
                     self.ask = ask;
                     Some(WebEvent::Ask)

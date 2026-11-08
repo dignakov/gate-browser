@@ -171,6 +171,10 @@ pub const ROW_HEIGHT: f32 = 30.0;
 pub const PANE_HEADER_HEIGHT: f32 = 30.0;
 /// Space around and between panes.
 pub const GAP: f32 = 8.0;
+/// The smallest a tile may get from a split (see `layout::next_tile`);
+/// smaller, a new page opens as a space.
+pub const TILE_MIN_WIDTH: f32 = 320.0;
+pub const TILE_MIN_HEIGHT: f32 = 200.0;
 
 /// Text colors for one surface, chosen for what is behind it: the sidebar
 /// over a see-through background gets brighter grays (or dark ones, over a

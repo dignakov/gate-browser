@@ -5,11 +5,15 @@ pub const START: &str = "about:blank";
 
 const SEARCH: &str = "https://www.google.com/search?q=";
 
-/// Turns what someone typed into a URL to load.
+/// Turns what someone typed into a URL to load. A leading `?` searches
+/// whatever follows, even if it looks like an address.
 pub fn resolve(input: &str) -> String {
     let text = input.trim();
     if text.is_empty() {
         return START.to_string();
+    }
+    if let Some(words) = text.strip_prefix('?') {
+        return search(words);
     }
     if has_scheme(text) {
         return text.to_string();
@@ -18,7 +22,12 @@ pub fn resolve(input: &str) -> String {
         let local = is_local(text);
         return format!("{}://{text}", if local { "http" } else { "https" });
     }
-    format!("{SEARCH}{}", encode(text))
+    search(text)
+}
+
+/// The web search for `words`.
+pub fn search(words: &str) -> String {
+    format!("{SEARCH}{}", encode(words.trim_start_matches('?').trim()))
 }
 
 /// Whether typed text means an address (not a search).
@@ -92,6 +101,9 @@ mod tests {
         assert_eq!(resolve("e.g"), "https://www.google.com/search?q=e.g");
         assert_eq!(resolve("about:blank"), "about:blank");
         assert_eq!(resolve("c++"), "https://www.google.com/search?q=c%2B%2B");
+        // A leading `?` searches, even what looks like an address.
+        assert_eq!(resolve("?example.com"), "https://www.google.com/search?q=example.com");
+        assert_eq!(resolve("? rust gpui"), "https://www.google.com/search?q=rust+gpui");
     }
 
     #[test]

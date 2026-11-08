@@ -1,0 +1,99 @@
+WPE answers pages' clipboard reads (the Async Clipboard API, execCommand
+paste) through a WebKitClipboardPermissionRequest on permission-request,
+as WebKitGTK does, instead of always denying them.
+
+--- a/Source/WebKit/SourcesWPE.txt
++++ b/Source/WebKit/SourcesWPE.txt
+@@ -171,6 +171,7 @@
+ UIProcess/API/glib/WebKitNotificationProvider.cpp @no-unify
+ UIProcess/API/glib/WebKitOptionMenu.cpp @no-unify
+ UIProcess/API/glib/WebKitOptionMenuItem.cpp @no-unify
++UIProcess/API/glib/WebKitClipboardPermissionRequest.cpp @no-unify
+ UIProcess/API/glib/WebKitPermissionRequest.cpp @no-unify
+ UIProcess/API/glib/WebKitPermissionStateQuery.cpp @no-unify
+ UIProcess/API/glib/WebKitPointerLockPermissionRequest.cpp @no-unify
+--- a/Source/WebKit/PlatformWPE.cmake
++++ b/Source/WebKit/PlatformWPE.cmake
+@@ -198,6 +198,7 @@
+     ${WEBKIT_DIR}/UIProcess/API/glib/WebKitNotification.h.in
+     ${WEBKIT_DIR}/UIProcess/API/glib/WebKitOptionMenu.h.in
+     ${WEBKIT_DIR}/UIProcess/API/glib/WebKitOptionMenuItem.h.in
++    ${WEBKIT_DIR}/UIProcess/API/glib/WebKitClipboardPermissionRequest.h.in
+     ${WEBKIT_DIR}/UIProcess/API/glib/WebKitPermissionRequest.h.in
+     ${WEBKIT_DIR}/UIProcess/API/glib/WebKitPermissionStateQuery.h.in
+     ${WEBKIT_DIR}/UIProcess/API/glib/WebKitPointerLockPermissionRequest.h.in
+--- a/Source/WebKit/UIProcess/API/glib/webkit.h.in
++++ b/Source/WebKit/UIProcess/API/glib/webkit.h.in
+@@ -45,8 +45,8 @@
+ #include <@API_INCLUDE_PREFIX@/WebKitAutomationSession.h>
+ #include <@API_INCLUDE_PREFIX@/WebKitBackForwardList.h>
+ #include <@API_INCLUDE_PREFIX@/WebKitBackForwardListItem.h>
+-#if PLATFORM(GTK)
+ #include <@API_INCLUDE_PREFIX@/WebKitClipboardPermissionRequest.h>
++#if PLATFORM(GTK)
+ #include <@API_INCLUDE_PREFIX@/WebKitColorChooserRequest.h>
+ #endif
+ #include <@API_INCLUDE_PREFIX@/WebKitContextMenu.h>
+--- a/Source/WebKit/UIProcess/API/wpe/APIViewClient.h
++++ b/Source/WebKit/UIProcess/API/wpe/APIViewClient.h
+@@ -26,6 +26,7 @@
+ #pragma once
+ 
+ #include "UserMessage.h"
++#include <WebCore/DOMPasteAccess.h>
+ #include <wtf/CompletionHandler.h>
+ #include <wtf/TZoneMallocInlines.h>
+ 
+@@ -56,6 +57,7 @@
+     virtual WebKit::WebKitWebResourceLoadManager* webResourceLoadManager() { return nullptr; }
+     virtual void themeColorDidChange() { }
+     virtual void pageScaleFactorDidChange(WKWPE::View&) { }
++    virtual void requestDOMPasteAccess(WKWPE::View&, CompletionHandler<void(WebCore::DOMPasteAccessResponse)>&& completionHandler) { completionHandler(WebCore::DOMPasteAccessResponse::DeniedForGesture); }
+ 
+ #if ENABLE(FULLSCREEN_API)
+     virtual bool enterFullScreen(WKWPE::View&) { return false; };
+--- a/Source/WebKit/UIProcess/API/wpe/WebKitWebViewClient.h
++++ b/Source/WebKit/UIProcess/API/wpe/WebKitWebViewClient.h
+@@ -57,6 +57,7 @@
+     WebKit::WebKitWebResourceLoadManager* webResourceLoadManager() override;
+     void themeColorDidChange() override;
+     void pageScaleFactorDidChange(WKWPE::View&) override;
++    void requestDOMPasteAccess(WKWPE::View&, CompletionHandler<void(WebCore::DOMPasteAccessResponse)>&&) override;
+ 
+ #if ENABLE(FULLSCREEN_API)
+     bool enterFullScreen(WKWPE::View&) override;
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebView.cpp
+@@ -119,6 +119,7 @@
+ 
+ #if PLATFORM(WPE)
+ #include "WPEUtilities.h"
++#include "WebKitClipboardPermissionRequestPrivate.h"
+ #include "WPEWebViewLegacy.h"
+ #include "WPEWebViewPlatform.h"
+ #include "WebContextMenuProxy.h"
+@@ -600,6 +601,12 @@
+     webkitWebViewDidChangePageScale(m_webView);
+ }
+ 
++void WebKitWebViewClient::requestDOMPasteAccess(WKWPE::View&, CompletionHandler<void(WebCore::DOMPasteAccessResponse)>&& completionHandler)
++{
++    auto request = adoptGRef(webkitClipboardPermissionRequestCreate(WTF::move(completionHandler)));
++    webkitWebViewMakePermissionRequest(m_webView, WEBKIT_PERMISSION_REQUEST(request.get()));
++}
++
+ #if ENABLE(FULLSCREEN_API)
+ bool WebKitWebViewClient::enterFullScreen(WKWPE::View&)
+ {
+--- a/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
++++ b/Source/WebKit/UIProcess/API/wpe/PageClientImpl.cpp
+@@ -540,7 +540,8 @@
+                 }
+             }
+         }
+-        // FIXME: add WebKitClipboardPermissionRequest support.
++        m_view.client().requestDOMPasteAccess(m_view, WTF::move(completionHandler));
++        return;
+     }
+ #endif
+     completionHandler(WebCore::DOMPasteAccessResponse::DeniedForGesture);

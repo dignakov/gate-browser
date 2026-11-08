@@ -10,7 +10,7 @@ mod present;
 
 pub(crate) use page::WpePage;
 
-use crate::engine::{Events, Menu, MenuItem, PageEvent};
+use crate::engine::{Events, Menu, MenuItem, PageEvent, Popup, PopupPage};
 use crate::{Ask, Playback, Started};
 use anyhow::{Context as _, Result};
 use present::{Buffer, Frame, Outbox, Reader, Surface};
@@ -136,6 +136,10 @@ pub(super) struct Route {
 }
 
 impl Route {
+    fn new(events: Events) -> Self {
+        Self { events, surface: Mutex::default(), state: Mutex::default(), playback: Mutex::default(), zoom: Mutex::new(1.0) }
+    }
+
     fn send(&self, event: PageEvent) {
         let _ = self.events.try_send(event);
     }
@@ -157,13 +161,7 @@ impl Worker {
     /// Adds a page; `None` once the helper stopped.
     fn route(&self, events: Events) -> Option<(u32, Arc<Route>)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let route = Arc::new(Route {
-            events,
-            surface: Mutex::default(),
-            state: Mutex::default(),
-            playback: Mutex::default(),
-            zoom: Mutex::new(1.0),
-        });
+        let route = Arc::new(Route::new(events));
         let mut routes = self.routes.lock().unwrap();
         // A helper that stopped before the route was in place would never
         // tell this page.
@@ -177,6 +175,18 @@ impl Worker {
     pub(super) fn forget(&self, id: u32) {
         self.routes.lock().unwrap().remove(&id);
     }
+}
+
+/// A page the helper opened for another (see [`Popup`]): routed from its
+/// first report, waiting for a view.
+pub(crate) struct Opened {
+    pub(super) id: u32,
+    pub(super) route: Arc<Route>,
+}
+
+/// The running helper, for pages it opened.
+pub(super) fn worker() -> Option<Arc<Worker>> {
+    WORKER.lock().unwrap().clone()
 }
 
 /// A new page on the running helper, starting one (for `gpu`, the GPU the
@@ -242,6 +252,37 @@ fn start(gpu: Option<gpui::DmabufTarget>) -> Arc<Worker> {
     worker
 }
 
+/// The system's GStreamer plugins, which Gate's GStreamer loads after its
+/// own (FFmpeg's decoders and the like).
+const SYSTEM_PLUGINS: [&str; 4] = [
+    "/usr/lib/x86_64-linux-gnu/gstreamer-1.0",
+    "/usr/lib/aarch64-linux-gnu/gstreamer-1.0",
+    "/usr/lib64/gstreamer-1.0",
+    "/usr/lib/gstreamer-1.0",
+];
+
+/// WebKit runs on the GStreamer in lib/ beside the helper (see
+/// xtask/src/wpe.rs): its plugins come first, its plugin scanner reads
+/// them, and its registry stays apart from the system GStreamer's.
+fn use_bundled_gstreamer(command: &mut Command, profile: Option<&Path>) {
+    let Some(lib) = helper_path().parent().map(|dir| dir.join("lib")) else { return };
+    let plugins = lib.join("gstreamer-1.0");
+    if !plugins.is_dir() {
+        return;
+    }
+    let path = std::iter::once(plugins.as_path())
+        .chain(SYSTEM_PLUGINS.iter().map(Path::new).filter(|dir| dir.is_dir()))
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    command
+        .env("GST_PLUGIN_SYSTEM_PATH_1_0", path)
+        .env("GST_PLUGIN_SCANNER_1_0", lib.join("../libexec/gstreamer-1.0/gst-plugin-scanner"));
+    if let Some(profile) = profile {
+        command.env("GST_REGISTRY_1_0", profile.join("gstreamer-registry.bin"));
+    }
+}
+
 /// Starts the helper and waits for it to say it is ready.
 fn spawn(profile: Option<&Path>, gpu: Option<gpui::DmabufTarget>) -> Result<(Child, UnixStream)> {
     let (socket, theirs) = UnixStream::pair()?;
@@ -249,6 +290,7 @@ fn spawn(profile: Option<&Path>, gpu: Option<gpui::DmabufTarget>) -> Result<(Chi
     if let Some(profile) = profile {
         command.arg("--profile").arg(profile);
     }
+    use_bundled_gstreamer(&mut command, profile);
     // `GATE_WPE_FRAMES=shm` keeps frames in shared memory, rendered by the
     // CPU; `readback` renders them on the GPU and reads them back.
     let frames = std::env::var("GATE_WPE_FRAMES");
@@ -322,6 +364,19 @@ fn read(socket: UnixStream, routes: &Mutex<HashMap<u32, Weak<Route>>>, outbox: &
         loop {
             let (kind, id, data) = reader.next()?;
             let route = routes.lock().unwrap().get(&id).and_then(Weak::upgrade);
+            // A page `id` opened: routed before anything it reports comes.
+            if kind == b'O' {
+                let opened = serde_json::from_slice::<Value>(&data).ok().and_then(|v| v["id"].as_u64()).map(|id| id as u32);
+                if let (Some(opener), Some(popup)) = (route.as_ref(), opened) {
+                    let popup = Popup::new(|events| {
+                        let route = Arc::new(Route::new(events));
+                        routes.lock().unwrap().insert(popup, Arc::downgrade(&route));
+                        PopupPage::Wpe(Opened { id: popup, route })
+                    });
+                    opener.send(PageEvent::Popup(popup));
+                }
+                continue;
+            }
             let Some(route) = route else {
                 // A closed page: still take the descriptor it sent.
                 if kind == b'B' {
@@ -341,6 +396,24 @@ fn read(socket: UnixStream, routes: &Mutex<HashMap<u32, Weak<Route>>>, outbox: &
         let _ = connection.shutdown(std::net::Shutdown::Both);
     }
     helper_stopped(routes, stopped);
+}
+
+/// A download's report ('D').
+fn download(v: &Value) -> Option<crate::Download> {
+    let state = match v["state"].as_str()? {
+        "running" => crate::DownloadState::Running,
+        "done" => crate::DownloadState::Done,
+        "cancelled" => crate::DownloadState::Cancelled,
+        _ => crate::DownloadState::Failed(v["error"].as_str().unwrap_or_default().to_string()),
+    };
+    Some(crate::Download {
+        id: v["id"].as_u64()?,
+        name: v["name"].as_str().unwrap_or_default().to_string(),
+        path: v["path"].as_str().unwrap_or_default().into(),
+        received: v["received"].as_u64().unwrap_or_default(),
+        total: v["total"].as_u64().filter(|t| *t > 0),
+        state,
+    })
 }
 
 fn packet(route: &Route, outbox: &Outbox, page: u32, kind: u8, data: &[u8], reader: &mut Reader) -> std::io::Result<()> {
@@ -408,11 +481,40 @@ fn packet(route: &Route, outbox: &Outbox, page: u32, kind: u8, data: &[u8], read
             if let Some(v) = json()
                 && let Some(url) = v["url"].as_str()
             {
-                route.send(PageEvent::OpenTab { url: url.to_string(), background: v["background"].as_bool().unwrap_or(false) });
+                route.send(PageEvent::OpenTab {
+                    url: url.to_string(),
+                    background: v["background"].as_bool().unwrap_or(false),
+                    alternate: v["alternate"].as_bool().unwrap_or(false),
+                });
             }
         }
         b'C' => route.send(PageEvent::Clipboard(text())),
+        b'Q' => route.send(PageEvent::CloseRequested),
+        b'D' => {
+            if let Some(download) = json().as_ref().and_then(download) {
+                route.send(PageEvent::Download(download));
+            }
+        }
+        b'L' => {
+            if let Some(v) = json() {
+                route.send(PageEvent::Notification(crate::Notification {
+                    id: v["id"].as_u64().unwrap_or_default(),
+                    title: v["title"].as_str().unwrap_or_default().to_string(),
+                    body: v["body"].as_str().unwrap_or_default().to_string(),
+                }));
+            }
+        }
+        b'Z' => {
+            if let Some(id) = json().and_then(|v| v["id"].as_u64()) {
+                route.send(PageEvent::NotificationClosed(id));
+            }
+        }
         b'M' => route.send(PageEvent::Menu(json().as_ref().and_then(menu))),
+        b'H' => {
+            if let Some(menu) = json().as_ref().and_then(context_menu) {
+                route.send(PageEvent::ContextMenu(menu));
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -514,6 +616,22 @@ fn menu(v: &Value) -> Option<Menu> {
         width: v["width"].as_f64().unwrap_or(0.0) as f32,
         items,
     })
+}
+
+/// A right-click menu ('H'), at a point in the page.
+fn context_menu(v: &Value) -> Option<crate::ContextMenu> {
+    let items = v["items"]
+        .as_array()?
+        .iter()
+        .map(|item| match item["separator"].as_bool() {
+            Some(true) => crate::ContextMenuItem::Separator,
+            _ => crate::ContextMenuItem::Command {
+                label: item["label"].as_str().unwrap_or_default().to_string(),
+                enabled: item["enabled"].as_bool().unwrap_or(true),
+            },
+        })
+        .collect();
+    Some(crate::ContextMenu { at: gpui::point(gpui::px(v["x"].as_f64()? as f32), gpui::px(v["y"].as_f64()? as f32)), items })
 }
 
 /// The question an `A` packet asks; none for `null`.

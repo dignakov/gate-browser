@@ -390,7 +390,7 @@ wrap_life_span_handler! {
         ) -> ::std::os::raw::c_int {
             // We own tabs: every new window becomes one of our tabs.
             let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
-            self.shared.borrow().push(PageEvent::OpenTab { url: text(target_url), background });
+            self.shared.borrow().push(PageEvent::OpenTab { url: text(target_url), background, alternate: false });
             1
         }
 

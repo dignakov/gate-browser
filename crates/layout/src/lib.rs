@@ -148,6 +148,31 @@ impl Node {
         }
     }
 
+    /// The pane the most splits down, and how many. Of those tied, the one
+    /// a spiral placed last: its step at that depth went right or down (the
+    /// later child) or left or up (the earlier), see [`next_tile`].
+    pub fn deepest(&self) -> (PaneId, usize) {
+        self.deepest_from(0)
+    }
+
+    fn deepest_from(&self, level: usize) -> (PaneId, usize) {
+        match self {
+            Node::Pane { pane } => (*pane, 0),
+            Node::Split { children, .. } => {
+                let earlier = SPIRAL[level % 4].before();
+                let mut best: Option<(PaneId, usize)> = None;
+                for (p, d) in children.iter().map(|c| c.node.deepest_from(level + 1)) {
+                    best = match best {
+                        Some((_, bd)) if bd > d || (bd == d && earlier) => best,
+                        _ => Some((p, d)),
+                    };
+                }
+                let (pane, depth) = best.expect("a split has children");
+                (pane, depth + 1)
+            }
+        }
+    }
+
     pub fn panes(&self) -> Vec<PaneId> {
         let mut out = Vec::new();
         self.collect(&mut out);
@@ -173,16 +198,18 @@ impl Node {
         self.insert(target, edge, Node::pane(new))
     }
 
-    fn insert(&mut self, target: PaneId, edge: Edge, new: Node) -> bool {
+    /// Puts a whole tree beside `target` on `edge`, in the space a new pane
+    /// would get there, its own splits kept. False if `target` is not here.
+    pub fn insert(&mut self, target: PaneId, edge: Edge, new: Node) -> bool {
         let axis = edge.axis();
         match self {
             Node::Pane { pane } if *pane == target => {
                 let old = std::mem::replace(self, Node::pane(0));
+                let at = if edge.before() { 0 } else { 1 };
                 let (a, b) = if edge.before() { (new, old) } else { (old, new) };
-                *self = Node::Split {
-                    axis,
-                    children: vec![Child { weight: 1.0, node: a }, Child { weight: 1.0, node: b }],
-                };
+                let mut children = vec![Child { weight: 1.0, node: a }, Child { weight: 1.0, node: b }];
+                normalize_child(axis, &mut children, at);
+                *self = Node::Split { axis, children };
                 true
             }
             Node::Pane { .. } => false,
@@ -197,6 +224,7 @@ impl Node {
                     children[i].weight = half;
                     let at = if edge.before() { i } else { i + 1 };
                     children.insert(at, Child { weight: half, node: new });
+                    normalize_child(axis, children, at);
                     return true;
                 }
                 let done = children[i].node.insert(target, edge, new);
@@ -320,6 +348,8 @@ impl Node {
                 let total: f32 = children.iter().map(|c| c.weight).sum();
                 let mut at = 0.0;
                 let mut spans = Vec::with_capacity(children.len());
+                // This split's dividers, among the children's own.
+                let mut own = Vec::with_capacity(children.len() - 1);
                 for (i, child) in children.iter().enumerate() {
                     let len = free * child.weight / total;
                     let rect = match axis {
@@ -336,14 +366,14 @@ impl Node {
                             Axis::Row => Rect::new(area.x + at, area.y, gap, area.h),
                             Axis::Column => Rect::new(area.x, area.y + at, area.w, gap),
                         };
+                        own.push(g.dividers.len());
                         g.dividers.push(Divider { path: path.clone(), index: i, axis: *axis, rect, span: 0.0 });
                         at += gap;
                     }
                 }
                 // Each divider resizes its two neighbors.
-                let first = g.dividers.len() - (children.len() - 1);
-                for (k, d) in g.dividers[first..].iter_mut().enumerate() {
-                    d.span = spans[k] + spans[k + 1];
+                for (k, d) in own.into_iter().enumerate() {
+                    g.dividers[d].span = spans[k] + spans[k + 1];
                 }
             }
         }
@@ -408,6 +438,33 @@ fn normalize_child(axis: Axis, children: &mut Vec<Child>, i: usize) {
 
 /// Which side of a pane a point falls on for a drop: the outer quarter picks
 /// the nearest edge, the middle is `None` (swap / replace).
+/// The spiral's turns, one per split from the outside in.
+const SPIRAL: [Edge; 4] = [Edge::Right, Edge::Bottom, Edge::Left, Edge::Top];
+
+/// Where a new tile goes in a space laid out in `area` (see
+/// [`Node::geometry`]): beside which pane, on which edge. `None` when the
+/// halves it would make are smaller than `min` (width, height).
+///
+/// Spiral: always the innermost pane (the deepest), the new one going
+/// right, below, left, then above it as the spiral turns inward. Otherwise
+/// `focused`, split along its longer side.
+pub fn next_tile(root: &Node, area: Rect, gap: f32, focused: PaneId, spiral: bool, min: (f32, f32)) -> Option<(PaneId, Edge)> {
+    let geometry = root.geometry(area, gap);
+    let (pane, edge) = if spiral {
+        let (pane, depth) = root.deepest();
+        (pane, SPIRAL[depth % 4])
+    } else {
+        let rect = geometry.rect(focused)?;
+        (focused, if rect.w >= rect.h { Edge::Right } else { Edge::Bottom })
+    };
+    let rect = geometry.rect(pane)?;
+    let fits = match edge.axis() {
+        Axis::Row => (rect.w - gap) / 2.0 >= min.0,
+        Axis::Column => (rect.h - gap) / 2.0 >= min.1,
+    };
+    fits.then_some((pane, edge))
+}
+
 pub fn drop_zone(rect: Rect, x: f32, y: f32) -> Option<Option<Edge>> {
     if !rect.contains(x, y) || rect.w <= 0.0 || rect.h <= 0.0 {
         return None;
@@ -523,6 +580,65 @@ mod tests {
     }
 
     #[test]
+    fn spiral_turns_inward() {
+        let mut n = Node::pane(1);
+        let min = (100.0, 100.0);
+        let mut placed = Vec::new();
+        for new in 2..=6 {
+            let (pane, edge) = next_tile(&n, area(), 0.0, 1, true, min).unwrap();
+            placed.push((pane, edge));
+            assert!(n.split(pane, edge, new));
+            check(&n);
+        }
+        assert_eq!(
+            placed,
+            vec![(1, Edge::Right), (2, Edge::Bottom), (3, Edge::Left), (4, Edge::Top), (5, Edge::Right)]
+        );
+        // Closing the innermost pane lets the one before it continue.
+        assert!(n.remove(6));
+        assert_eq!(next_tile(&n, area(), 0.0, 1, true, min), Some((5, Edge::Right)));
+    }
+
+    #[test]
+    fn new_tile_splits_the_longer_side_and_stops_when_small() {
+        let n = Node::pane(1);
+        assert_eq!(next_tile(&n, area(), 0.0, 1, false, (100.0, 100.0)), Some((1, Edge::Right)));
+        let tall = Rect::new(0.0, 0.0, 400.0, 900.0);
+        assert_eq!(next_tile(&n, tall, 0.0, 1, false, (100.0, 100.0)), Some((1, Edge::Bottom)));
+        assert_eq!(next_tile(&n, area(), 0.0, 1, false, (600.0, 100.0)), None);
+    }
+
+    #[test]
+    fn dividers_beside_a_nested_split_resize() {
+        // One pane on the left, two stacked on the right.
+        let mut n = Node::pane(1);
+        n.split(1, Edge::Right, 2);
+        n.split(2, Edge::Bottom, 3);
+        let g = n.geometry(area(), 0.0);
+        let row = g.dividers.iter().find(|d| d.axis == Axis::Row).unwrap().clone();
+        let column = g.dividers.iter().find(|d| d.axis == Axis::Column).unwrap().clone();
+        assert_eq!(row.span, 1000.0);
+        assert_eq!(column.span, 800.0);
+        assert!(n.resize(&row.path, row.index, 100.0, row.span));
+        assert!((n.geometry(area(), 0.0).rect(1).unwrap().w - 600.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn divider_between_two_nested_splits_resizes() {
+        // Top and bottom, each split left and right: four panes.
+        let mut n = Node::pane(1);
+        n.split(1, Edge::Bottom, 3);
+        n.split(1, Edge::Right, 2);
+        n.split(3, Edge::Right, 4);
+        let g = n.geometry(area(), 0.0);
+        let column = g.dividers.iter().find(|d| d.axis == Axis::Column).unwrap().clone();
+        assert_eq!(column.span, 800.0);
+        assert!(g.dividers.iter().filter(|d| d.axis == Axis::Row).all(|d| d.span == 1000.0));
+        assert!(n.resize(&column.path, column.index, 100.0, column.span));
+        assert!((n.geometry(area(), 0.0).rect(1).unwrap().h - 500.0).abs() < 0.01);
+    }
+
+    #[test]
     fn geometry_and_dividers() {
         let mut n = Node::pane(1);
         n.split(1, Edge::Right, 2);
@@ -568,6 +684,34 @@ mod tests {
         assert_eq!(drop_zone(r, 50.0, 95.0), Some(Some(Edge::Bottom)));
         assert_eq!(drop_zone(r, 50.0, 50.0), Some(None));
         assert_eq!(drop_zone(r, 150.0, 50.0), None);
+    }
+
+    #[test]
+    fn insert_tree_keeps_its_splits() {
+        // row[1, 2] beside 3 on the right: row[3, 1, 2], the tree's two
+        // sharing the half a pane would get.
+        let mut tree = Node::pane(1);
+        tree.split(1, Edge::Right, 2);
+        let mut n = Node::pane(3);
+        assert!(n.insert(3, Edge::Right, tree.clone()));
+        assert_eq!(n.panes(), vec![3, 1, 2]);
+        let g = n.geometry(Rect::new(0.0, 0.0, 400.0, 100.0), 0.0);
+        assert_eq!(g.rect(3).unwrap().w, 200.0);
+        assert_eq!(g.rect(1).unwrap().w, 100.0);
+        assert_eq!(g.rect(2).unwrap().w, 100.0);
+        // Below 3 instead: col[3, row[1, 2]].
+        let mut n = Node::pane(3);
+        assert!(n.insert(3, Edge::Bottom, tree.clone()));
+        let g = n.geometry(Rect::new(0.0, 0.0, 400.0, 100.0), 0.0);
+        assert_eq!(g.rect(1).unwrap(), Rect::new(0.0, 50.0, 200.0, 50.0));
+        // Beside a pane already in a row: flattened into it.
+        let mut n = Node::pane(3);
+        n.split(3, Edge::Right, 4);
+        assert!(n.insert(4, Edge::Left, tree));
+        assert_eq!(n.panes(), vec![3, 1, 2, 4]);
+        let Node::Split { children, .. } = &n else { panic!() };
+        assert_eq!(children.len(), 4);
+        assert!(!n.insert(9, Edge::Left, Node::pane(5)));
     }
 
     #[test]

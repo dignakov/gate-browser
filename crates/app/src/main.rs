@@ -10,6 +10,7 @@ mod backdrop;
 mod chrome;
 mod db;
 mod look;
+mod notices;
 mod palette;
 mod render;
 mod session;

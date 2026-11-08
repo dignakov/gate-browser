@@ -32,6 +32,8 @@ pub struct SavedSpace {
     pub focused: PaneId,
     pub zoomed: Option<PaneId>,
     pub pages: Vec<SavedPage>,
+    #[serde(default)]
+    pub unvisited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -101,6 +103,7 @@ impl Workspace {
                 root: tab.root.clone(),
                 focused: tab.focused,
                 zoomed: tab.zoomed,
+                unvisited: tab.unvisited,
                 pages: tab
                     .root
                     .panes()
@@ -160,7 +163,7 @@ impl Workspace {
             let focused = renamed.get(&space.focused).copied().unwrap_or(first);
             let zoomed = space.zoomed.and_then(|z| renamed.get(&z).copied());
             let id = self.fresh_id();
-            self.tabs.push(Tab { id, name: space.name, root, focused, zoomed });
+            self.tabs.push(Tab { id, name: space.name, root, focused, zoomed, unvisited: space.unvisited });
         }
         self.active = session.active.min(self.tabs.len().saturating_sub(1));
     }

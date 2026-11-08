@@ -27,6 +27,9 @@ pub struct Settings {
     /// where the platform can (read at startup). Off until verified: see
     /// `web`'s gpu_frames module.
     pub gpu_frames: bool,
+    /// Links opened beside (middle or Ctrl+click) become tiles of the
+    /// space, placed in a spiral, not spaces of their own.
+    pub tiling_spiral: bool,
 }
 
 impl Default for Settings {
@@ -41,6 +44,7 @@ impl Default for Settings {
             chrome_opacity: 1.0,
             blur: 30.0,
             gpu_frames: false,
+            tiling_spiral: false,
         }
     }
 }

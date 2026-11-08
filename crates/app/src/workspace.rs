@@ -19,6 +19,9 @@ actions!(
     workspace,
     [
         NewTab,
+        NewTile,
+        RecentSpace,
+        RecentSpaceBack,
         ClosePane,
         CloseTab,
         FocusAddress,
@@ -60,9 +63,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-right", Forward, ctx),
         KeyBinding::new("ctrl-\\", SplitRight, ctx),
         KeyBinding::new("ctrl-shift-\\", SplitDown, ctx),
+        KeyBinding::new("ctrl-alt-enter", NewTile, ctx),
         KeyBinding::new("ctrl-b", ToggleSidebar, ctx),
-        KeyBinding::new("ctrl-tab", NextTab, ctx),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, ctx),
+        KeyBinding::new("ctrl-tab", RecentSpace, ctx),
+        KeyBinding::new("ctrl-shift-tab", RecentSpaceBack, ctx),
+        KeyBinding::new("ctrl-pagedown", NextTab, ctx),
+        KeyBinding::new("ctrl-pageup", PrevTab, ctx),
         KeyBinding::new("ctrl-alt-left", FocusLeft, ctx),
         KeyBinding::new("ctrl-alt-right", FocusRight, ctx),
         KeyBinding::new("ctrl-alt-up", FocusUp, ctx),
@@ -92,6 +98,8 @@ pub struct Tab {
     pub focused: PaneId,
     /// Shown alone, filling the tab, while set.
     pub zoomed: Option<PaneId>,
+    /// Opened in the background (a middle click) and not looked at yet.
+    pub unvisited: bool,
 }
 
 pub struct Pane {
@@ -119,13 +127,25 @@ pub struct PaneDrag {
     pub target: Option<DropTarget>,
 }
 
+/// A space held by its sidebar entry: dropped beside a pane, it joins that
+/// space as a split; not moved, it was a click.
+pub struct SpaceDrag {
+    pub tab: TabId,
+    pub origin: Point<Pixels>,
+    pub clicks: usize,
+    pub moved: bool,
+    /// The pane it would go beside, and on which side.
+    pub target: Option<(PaneId, Edge)>,
+}
+
 /// Where a dragged pane would go.
 #[derive(Clone, Copy, PartialEq)]
 pub enum DropTarget {
     /// Beside another pane (an edge), or in its place (a swap).
     Pane(PaneId, Option<Edge>),
-    /// Out of its tab, into a space of its own (dropped on the sidebar).
-    NewSpace,
+    /// Out of its tab, into a space of its own (dropped on the sidebar),
+    /// at this place in the list.
+    NewSpace(usize),
 }
 
 /// How far a held header must move to become a drag.
@@ -159,15 +179,17 @@ pub struct SettingsDialog {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Look,
+    Tiling,
     AdBlocking,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 2] = [Self::Look, Self::AdBlocking];
+    pub const ALL: [Self; 3] = [Self::Look, Self::Tiling, Self::AdBlocking];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Look => "Look",
+            Self::Tiling => "Tiling",
             Self::AdBlocking => "Ad blocking",
         }
     }
@@ -175,9 +197,17 @@ impl SettingsSection {
     pub fn icon(self) -> &'static str {
         match self {
             Self::Look => "icons/palette.svg",
+            Self::Tiling => "icons/columns-2.svg",
             Self::AdBlocking => "icons/shield.svg",
         }
     }
+}
+
+/// Ctrl+Tab in progress: the spaces in the order it steps through them and
+/// where it is; releasing Ctrl goes there.
+pub struct Switching {
+    pub order: Vec<TabId>,
+    pub at: usize,
 }
 
 /// A space being renamed: its id and the field.
@@ -198,6 +228,20 @@ pub struct Workspace {
     pub renaming: Option<Renaming>,
     pub divider_drag: Option<DividerDrag>,
     pub pane_drag: Option<PaneDrag>,
+    pub space_drag: Option<SpaceDrag>,
+    /// Where each space's sidebar entry (or rail tile) was last laid out, by
+    /// its place in `tabs`: a pane dragged there lands between them.
+    pub space_rows: std::rc::Rc<std::cell::RefCell<Vec<(usize, gpui::Bounds<Pixels>)>>>,
+    /// Where the panes were last laid out (a new tile's size comes of it).
+    pub pane_area: layout::Rect,
+    /// Spaces by when they were last shown, the shown one first.
+    pub recent: Vec<TabId>,
+    /// Ctrl+Tab held: stepping through `recent` (see `step_recent`).
+    pub switching: Option<Switching>,
+    /// Downloads pages started, newest first (see [`crate::notices`]).
+    pub downloads: Vec<crate::notices::DownloadItem>,
+    /// Notifications pages showed, newest first.
+    pub notes: Vec<crate::notices::NoteItem>,
     pub store: Store,
     pub settings: Option<SettingsDialog>,
     pub palette: Option<Palette>,
@@ -229,7 +273,11 @@ impl Focusable for Workspace {
 
 impl Workspace {
     pub fn new(urls: Vec<String>, store: Store, db: Db, session: Session, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let address = cx.new(|cx| TextInput::new("Search or enter address", window, cx));
+        let address = cx.new(|cx| {
+            let mut input = TextInput::new("Search or enter address", window, cx);
+            input.paste_and_go = true;
+            input
+        });
         let address_events = cx.subscribe_in(&address, window, Self::address_event);
         let mut this = Self {
             tabs: Vec::new(),
@@ -240,8 +288,15 @@ impl Workspace {
             address_focused: false,
             sidebar: Sidebar { collapsed: false, width: theme::SIDEBAR_WIDTH, split: 0.5, drag: None },
             renaming: None,
+            space_rows: Default::default(),
+            pane_area: layout::Rect::new(0.0, 0.0, 1280.0, 800.0),
+            recent: Vec::new(),
+            switching: None,
+            downloads: Vec::new(),
+            notes: Vec::new(),
             divider_drag: None,
             pane_drag: None,
+            space_drag: None,
             store,
             settings: None,
             palette: None,
@@ -257,6 +312,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             _address_events: address_events,
         };
+        Self::on_system_notification(window, cx);
         // Hourly: is a uBlock Origin Lite check due (daily)?
         cx.spawn(async move |this, cx| {
             loop {
@@ -419,9 +475,14 @@ impl Workspace {
 
     pub fn open_tab(&mut self, url: &str, foreground: bool, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.new_pane(url, window, cx);
+        self.space_for(pane, foreground, window, cx);
+    }
+
+    /// A new space after the active one, holding `pane`.
+    fn space_for(&mut self, pane: PaneId, foreground: bool, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.fresh_id();
         let at = (self.active + 1).min(self.tabs.len());
-        self.tabs.insert(at, Tab { id, name: None, root: Node::pane(pane), focused: pane, zoomed: None });
+        self.tabs.insert(at, Tab { id, name: None, root: Node::pane(pane), focused: pane, zoomed: None, unvisited: !foreground });
         if foreground {
             self.activate(at, window, cx);
         } else {
@@ -446,6 +507,11 @@ impl Workspace {
             return;
         }
         self.active = index;
+        self.tabs[index].unvisited = false;
+        let id = self.tabs[index].id;
+        self.recent.retain(|t| *t != id);
+        self.recent.insert(0, id);
+        self.recent.truncate(64);
         // Pages of other tabs stop rendering until shown again.
         for (i, tab) in self.tabs.iter().enumerate() {
             for pane in tab.root.panes() {
@@ -485,7 +551,25 @@ impl Workspace {
 
     fn web_event(&mut self, pane: PaneId, event: &WebEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
-            WebEvent::OpenTab { url, background } => self.open_tab(url, !background, window, cx),
+            // Beside the page (middle or Ctrl+click): a tile or a space, as
+            // Settings has it, the other with Shift.
+            WebEvent::OpenTab { url, background: true, alternate } if self.store.settings.tiling_spiral != *alternate => {
+                self.open_tile(pane, url, window, cx)
+            }
+            WebEvent::OpenTab { url, background, .. } => self.open_tab(url, !background, window, cx),
+            // Windows the page opened (and keeps a hold of): spaces of their own.
+            WebEvent::Popup => {
+                let Some(opener) = self.panes.get(&pane).map(|p| p.view.clone()) else { return };
+                for popup in opener.update(cx, |view, _| view.take_popups()) {
+                    let view = cx.new(|cx| WebView::popup(popup, window, cx));
+                    let popup = self.add_pane(view, window, cx);
+                    self.space_for(popup, true, window, cx);
+                }
+            }
+            WebEvent::CloseRequested => self.close_pane(pane, window, cx),
+            WebEvent::Download(download) => self.download_changed(pane, download, cx),
+            WebEvent::Notification(note) => self.note_shown(pane, note, window, cx),
+            WebEvent::NotificationClosed(id) => self.note_closed(pane, *id, cx),
             // A shortcut pressed while the page held the keyboard. Replayed
             // once this update is over: its action handlers update the
             // workspace, which is busy here.
@@ -636,6 +720,26 @@ impl Workspace {
         }
     }
 
+    /// Where a new tile goes in the space at `index` (see
+    /// [`layout::next_tile`]); none when it would be too small.
+    pub fn next_tile(&self, index: usize, focused: PaneId) -> Option<(PaneId, Edge)> {
+        let tab = self.tabs.get(index)?;
+        layout::next_tile(&tab.root, self.pane_area, theme::GAP, focused, self.store.settings.tiling_spiral, (theme::TILE_MIN_WIDTH, theme::TILE_MIN_HEIGHT))
+    }
+
+    /// Opens `url` as the next tile of `opener`'s space, leaving focus where
+    /// it is; as a space behind when no tile fits.
+    pub fn open_tile(&mut self, opener: PaneId, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tab_of(opener) else { return self.open_tab(url, false, window, cx) };
+        let focused = self.tabs[index].focused;
+        let Some((target, edge)) = self.next_tile(index, focused) else { return self.open_tab(url, false, window, cx) };
+        let pane = self.new_pane(url, window, cx);
+        let tab = &mut self.tabs[index];
+        tab.zoomed = None;
+        tab.root.split(target, edge, pane);
+        cx.notify();
+    }
+
     /// Opens `address` in a new pane beside `target`.
     pub fn split_with(&mut self, target: PaneId, edge: Edge, address: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.tab_of(target) else { return };
@@ -683,6 +787,7 @@ impl Workspace {
         if let Some(p) = self.panes.remove(&pane) {
             p.view.update(cx, |v, _| v.close());
         }
+        self.forget_page_notices(pane, cx);
         let tab = &mut self.tabs[t];
         if tab.zoomed == Some(pane) {
             tab.zoomed = None;
@@ -706,6 +811,7 @@ impl Workspace {
             if let Some(p) = self.panes.remove(&pane) {
                 p.view.update(cx, |v, _| v.close());
             }
+            self.forget_page_notices(pane, cx);
         }
         if self.tabs.is_empty() {
             // The window empties; the palette asks where to go next.
@@ -731,8 +837,9 @@ impl Workspace {
         }
     }
 
-    /// Takes a pane out of its tab into a new space right after it.
-    pub fn pane_to_new_space(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+    /// Takes `pane` out of its space into a new one at `at` in the list,
+    /// put away there: the space it left stays shown.
+    pub fn pane_to_new_space(&mut self, pane: PaneId, at: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.tab_of(pane) else { return };
         // A tab's last pane already is a space of its own.
         if !self.tabs[index].root.remove(pane) {
@@ -746,8 +853,35 @@ impl Workspace {
             tab.focused = tab.root.panes()[0];
         }
         let id = self.fresh_id();
-        self.tabs.insert(index + 1, Tab { id, name: None, root: Node::pane(pane), focused: pane, zoomed: None });
-        self.activate(index + 1, window, cx);
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, Tab { id, name: None, root: Node::pane(pane), focused: pane, zoomed: None, unvisited: false });
+        if at <= self.active {
+            self.active += 1;
+        }
+        self.panes[&pane].view.update(cx, |v, _| v.set_hidden(true));
+        let focused = self.tabs[self.active].focused;
+        self.focus_pane(focused, window, cx);
+        cx.notify();
+    }
+
+    /// Moves a whole space beside `target`, a pane of another space, in the
+    /// half a new pane would get there: its splits keep their shares of
+    /// that, and its sidebar entry goes.
+    pub fn space_beside(&mut self, tab: TabId, target: PaneId, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.tabs.iter().position(|t| t.id == tab) else { return };
+        if self.tab_of(target).is_none_or(|t| t == from) {
+            return;
+        }
+        let moved = self.tabs.remove(from);
+        if from < self.active {
+            self.active -= 1;
+        }
+        let Some(index) = self.tab_of(target) else { return };
+        let into = &mut self.tabs[index];
+        into.zoomed = None;
+        into.root.insert(target, edge, moved.root);
+        into.focused = moved.focused;
+        self.activate(index, window, cx);
     }
 
     pub fn play_pause(&mut self, pane: PaneId, cx: &mut Context<Self>) {
@@ -917,6 +1051,13 @@ impl Workspace {
             v.update(cx, |v, _| v.forward());
         }
     }
+    pub fn on_new_tile(&mut self, _: &NewTile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return self.open_palette(Intent::NewSpace, window, cx) };
+        match self.next_tile(self.active, tab.focused) {
+            Some((target, edge)) => self.split_pane(target, edge, window, cx),
+            None => self.open_palette(Intent::NewSpace, window, cx),
+        }
+    }
     pub fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
         self.split(Edge::Right, window, cx);
     }
@@ -926,6 +1067,67 @@ impl Workspace {
     pub fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_sidebar(cx);
     }
+    pub fn on_recent_space(&mut self, _: &RecentSpace, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_recent(1, window, cx);
+    }
+    pub fn on_recent_space_back(&mut self, _: &RecentSpaceBack, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_recent(-1, window, cx);
+    }
+
+    /// Ctrl+Tab: steps through the spaces by when they were last shown
+    /// (the one before this first), marking where it is in the sidebar;
+    /// releasing Ctrl goes there. A tap goes back to the last space.
+    fn step_recent(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let started = self.switching.is_none();
+        let switching = self.switching.get_or_insert_with(|| {
+            let exists = |id: &TabId| self.tabs.iter().any(|t| t.id == *id);
+            let mut order: Vec<TabId> = self.recent.iter().copied().filter(exists).collect();
+            if let Some(shown) = self.tabs.get(self.active).map(|t| t.id) {
+                order.retain(|t| *t != shown);
+                order.insert(0, shown);
+            }
+            // Spaces never shown yet come last, in sidebar order.
+            order.extend(self.tabs.iter().map(|t| t.id).filter(|id| !order.contains(id)).collect::<Vec<_>>());
+            Switching { order, at: 0 }
+        });
+        if switching.order.len() < 2 {
+            self.switching = None;
+            return;
+        }
+        let len = switching.order.len() as isize;
+        switching.at = (switching.at as isize + step).rem_euclid(len) as usize;
+        cx.notify();
+        if started {
+            // Ctrl's release, wherever the keys go (see `web::control_held`).
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(30)).await;
+                    let held = this.update_in(cx, |ws, window, cx| {
+                        let held = web::control_held().unwrap_or(window.modifiers().control);
+                        if !held {
+                            ws.finish_switch(window, cx);
+                        }
+                        held && ws.switching.is_some()
+                    });
+                    if !held.unwrap_or(false) {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Goes to the space Ctrl+Tab stopped at.
+    fn finish_switch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(switching) = self.switching.take() else { return };
+        let target = switching.order[switching.at];
+        match self.tabs.iter().position(|t| t.id == target) {
+            Some(index) => self.activate(index, window, cx),
+            None => cx.notify(),
+        }
+    }
+
     pub fn on_next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
         if !self.tabs.is_empty() {
             self.activate((self.active + 1) % self.tabs.len(), window, cx);

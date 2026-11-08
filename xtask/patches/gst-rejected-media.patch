@@ -1,0 +1,20 @@
+webrtcbin accepts a description with rejected media sections (port 0) that
+carry no ICE or DTLS attributes, as RFC 9429 allows and Google Meet sends.
+
+diff --git a/subprojects/gst-plugins-bad/ext/webrtc/webrtcsdp.c b/subprojects/gst-plugins-bad/ext/webrtc/webrtcsdp.c
+index 0ece0c6..53f5348 100644
+--- a/subprojects/gst-plugins-bad/ext/webrtc/webrtcsdp.c
++++ b/subprojects/gst-plugins-bad/ext/webrtc/webrtcsdp.c
+@@ -313,6 +313,12 @@ validate_sdp (GstWebRTCSignalingState state, SDPSource source,
+     mid = gst_sdp_media_get_attribute_val (media, "mid");
+     media_in_bundle = is_bundle
+         && g_strv_contains ((const gchar **) group_members, mid);
++    /* A rejected media section has no transport, so no ICE or DTLS
++     * attributes to check (RFC 9429 5.3.1, 5.8.1). A bundle-only one uses
++     * the bundle's and is checked. */
++    if (gst_sdp_media_get_port (media) == 0
++        && !_media_has_attribute_key (media, "bundle-only"))
++      continue;
+     if (!_media_get_ice_ufrag (sdp->sdp, i)) {
+       g_set_error (error, GST_WEBRTC_ERROR, GST_WEBRTC_ERROR_SDP_SYNTAX_ERROR,
+           "media %u is missing or contains an empty \'ice-ufrag\' attribute",

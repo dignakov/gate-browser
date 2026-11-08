@@ -5,6 +5,7 @@
 mod engine;
 mod view;
 
+pub use engine::Popup;
 pub use view::{WebEvent, WebView};
 
 use anyhow::Result;
@@ -20,6 +21,76 @@ pub enum Ask {
     /// "Leave site?" before navigating away or reloading.
     Leave { reload: bool },
     Permission { origin: String, what: Vec<&'static str> },
+}
+
+/// A file a page is downloading, as it goes: into the Downloads folder (see
+/// [`download_path`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Download {
+    /// The engine's, unique within the page that started it.
+    pub id: u64,
+    /// The file's name, as saved.
+    pub name: String,
+    pub path: PathBuf,
+    pub received: u64,
+    pub total: Option<u64>,
+    pub state: DownloadState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    Running,
+    Done,
+    Cancelled,
+    Failed(String),
+}
+
+/// A page's right-click menu, drawn by the app (see
+/// [`WebView::context_menu`] and [`WebView::choose_context`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextMenu {
+    /// Where it opens, in window coordinates.
+    pub at: gpui::Point<gpui::Pixels>,
+    pub items: Vec<ContextMenuItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextMenuItem {
+    Command { label: String, enabled: bool },
+    Separator,
+}
+
+/// A notification a page shows (`new Notification(...)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notification {
+    /// The engine's, unique within the page.
+    pub id: u64,
+    pub title: String,
+    pub body: String,
+}
+
+/// Where a download named `suggested` is saved: the Downloads folder,
+/// numbered past files already there ("report (1).pdf").
+pub fn download_path(suggested: &str) -> PathBuf {
+    let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(std::env::temp_dir);
+    // Only a file name: no folders, nothing the file system forbids.
+    let name: String = Path::new(suggested)
+        .file_name()
+        .map(|n| n.to_string_lossy().chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect())
+        .filter(|n: &String| !n.trim().is_empty() && n != "." && n != "..")
+        .unwrap_or_else(|| "download".to_string());
+    let first = dir.join(&name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem.to_string(), format!(".{ext}")),
+        _ => (name.clone(), String::new()),
+    };
+    (1..)
+        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+        .find(|path| !path.exists())
+        .expect("a free name")
 }
 
 /// What a page's media is doing. Media counts once it played audibly.
@@ -132,6 +203,20 @@ pub fn set_dark_mode(dark: bool) {
 
 /// Gate's own shortcuts (Workspace bindings): engines whose pages hold the
 /// keyboard hand these back as [`WebEvent::Key`] instead of keeping them.
+/// Whether Ctrl is down now, where GPUI may not hear it: on Windows a page
+/// (Edge's own window) takes the keys while it has focus. `None` where
+/// GPUI's modifiers are always current.
+pub fn control_held() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+        // SAFETY: reads this thread's keyboard state.
+        Some(unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 pub fn set_app_shortcuts(shortcuts: Vec<gpui::Keystroke>) {
     #[cfg(windows)]
     engine::webview2::set_app_shortcuts(shortcuts);

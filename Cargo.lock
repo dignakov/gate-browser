@@ -6577,6 +6577,7 @@ dependencies = [
  "async-channel",
  "cef",
  "cef-dll-sys",
+ "dirs",
  "futures",
  "gpui",
  "image",

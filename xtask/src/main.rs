@@ -119,6 +119,51 @@ fn package_windows(root: &Path, target: &str, arch: &str) -> Result<PathBuf> {
     Ok(zip)
 }
 
+/// Copies the GStreamer WebKit was built with (see xtask/src/wpe.rs) from
+/// `install` into `app`: its plugins, its plugin scanner, and the libraries
+/// those and WebKit need (by soname). Returns what it copied.
+fn copy_gstreamer(install: &Path, app: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = vec![PathBuf::from("libexec/gstreamer-1.0/gst-plugin-scanner")];
+    for entry in fs::read_dir(install.join("lib/gstreamer-1.0"))? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".so") {
+            files.push(Path::new("lib/gstreamer-1.0").join(name));
+        }
+    }
+    // The libraries, followed from what needs them.
+    let mut needers: Vec<PathBuf> = files.iter().map(|f| install.join(f)).collect();
+    needers.push(install.join("lib/libWPEWebKit-2.0.so.1"));
+    let mut libraries = std::collections::BTreeSet::new();
+    while let Some(elf) = needers.pop() {
+        for name in needed(&elf)? {
+            if name.starts_with("libgst") && install.join("lib").join(&name).is_file() && libraries.insert(name.clone()) {
+                needers.push(install.join("lib").join(&name));
+            }
+        }
+    }
+    files.extend(libraries.into_iter().map(|name| Path::new("lib").join(name)));
+    let mut copied = Vec::new();
+    for file in files {
+        let to = app.join(&file);
+        fs::create_dir_all(to.parent().context("a file in a folder")?)?;
+        fs::copy(install.join(&file), &to).with_context(|| format!("copying {}", file.display()))?;
+        copied.push(to);
+    }
+    ensure!(app.join("lib/gstreamer-1.0/libgstwebrtc.so").is_file(), "GStreamer isn't built with WebRTC (cargo xtask build-wpe)");
+    Ok(copied)
+}
+
+/// The sonames an ELF file links (readelf's NEEDED entries).
+fn needed(elf: &Path) -> Result<Vec<String>> {
+    let out = Command::new("readelf").arg("-d").arg(elf).output().context("running readelf (binutils)")?;
+    ensure!(out.status.success(), "readelf failed on {}", elf.display());
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("(NEEDED)"))
+        .filter_map(|l| Some(l.split_once('[')?.1.split_once(']')?.0.to_string()))
+        .collect())
+}
+
 /// Linux: Gate on WPE WebKit as a Debian package
 /// (`dist/gate_<version>_<arch>.deb`). WebKit finds its processes and data
 /// relative to its library (xtask/patches/wpe-relocatable.patch), so it
@@ -146,11 +191,12 @@ fn package_deb(root: &Path, target: &str, arch: &str) -> Result<PathBuf> {
     for dir in ["lib/wpe-webkit-2.0", "libexec/wpe-webkit-2.0", "share/wpe-webkit-2.0"] {
         copy_tree(&wpe.join(dir), &app.join(dir), &|_| false)?;
     }
-    let elves = ["gate-wpe", "lib/libWPEWebKit-2.0.so.1", "lib/wpe-webkit-2.0/injected-bundle/libWPEInjectedBundle.so"]
+    let mut elves = ["gate-wpe", "lib/libWPEWebKit-2.0.so.1", "lib/wpe-webkit-2.0/injected-bundle/libWPEInjectedBundle.so"]
         .into_iter()
         .map(|f| app.join(f))
         .chain(["WPEWebProcess", "WPENetworkProcess", "WPEGPUProcess"].into_iter().map(|p| app.join("libexec/wpe-webkit-2.0").join(p)))
         .collect::<Vec<_>>();
+    elves.extend(copy_gstreamer(&wpe, &app)?);
     for elf in &elves {
         strip(elf)?;
     }
@@ -162,7 +208,10 @@ fn package_deb(root: &Path, target: &str, arch: &str) -> Result<PathBuf> {
     fs::write(applications.join("gate.desktop"), DESKTOP_ENTRY)?;
     copy_licenses(
         &stage.join("usr/share/doc/gate/licenses"),
-        wpe::NOTICES.map(|(notice, name)| (wpe.join("share/doc/wpe-webkit").join(notice), name)),
+        wpe::NOTICES
+            .map(|(notice, name)| (wpe.join("share/doc/wpe-webkit").join(notice), name))
+            .into_iter()
+            .chain([(wpe.join("share/doc/gstreamer").join(wpe::GST_NOTICE.0), wpe::GST_NOTICE.1)]),
     )?;
 
     let mut binaries = elves;
@@ -180,8 +229,7 @@ fn package_deb(root: &Path, target: &str, arch: &str) -> Result<PathBuf> {
              Maintainer: Gate <https://github.com/dignakov/gate-browser>\n\
              Installed-Size: {size_kb}\n\
              Depends: {depends}, glib-networking\n\
-             Recommends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-gl, gstreamer1.0-libav, xdg-desktop-portal\n\
-             Suggests: gstreamer1.0-plugins-bad\n\
+             Recommends: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-nice, gstreamer1.0-gl, gstreamer1.0-libav, xdg-desktop-portal\n\
              Section: web\n\
              Priority: optional\n\
              Homepage: https://github.com/dignakov/gate-browser\n\

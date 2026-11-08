@@ -4,6 +4,7 @@
 //!
 //! Search first: what is already open ranks above opening it again, so
 //! typing "slack" goes to the Slack you have rather than a second one.
+//! A leading `?` searches the web only, `??` history only.
 
 use crate::chrome::icon_glyph;
 use crate::render::{page_title, site_tile};
@@ -44,8 +45,8 @@ impl Intent {
 
     fn placeholder(self) -> &'static str {
         match self {
-            Self::Anything => "Search open pages, the web, or commands",
-            Self::NewSpace | Self::Split { .. } => "Search open pages or the web, or enter an address",
+            Self::Anything => "Search open pages, the web, or commands  (? web, ?? history)",
+            Self::NewSpace | Self::Split { .. } => "Search open pages or the web, or enter an address  (? web, ?? history)",
         }
     }
 }
@@ -192,8 +193,15 @@ impl Workspace {
         let Some((query, intent)) = self.palette.as_ref().map(|p| (p.input.read(cx).text().trim().to_string(), p.intent)) else {
             return;
         };
-        let history = self.history_choices(&query, cx);
-        let choices = self.palette_choices(&query, intent, history, cx);
+        let choices = if let Some(words) = query.strip_prefix("??") {
+            self.history_only(words.trim())
+        } else if let Some(words) = query.strip_prefix('?') {
+            let words = words.trim();
+            if words.is_empty() { Vec::new() } else { vec![Choice::Search(words.to_string())] }
+        } else {
+            let history = self.history_choices(&query, cx);
+            self.palette_choices(&query, intent, history, cx)
+        };
         if let Some(p) = self.palette.as_mut() {
             p.choices = choices;
             p.selected = 0;
@@ -216,6 +224,18 @@ impl Workspace {
             .into_iter()
             .filter(|p| !open.contains(&p.url))
             .take(8)
+            .map(|p| {
+                let icon = self.cached_favicon(url::host(&p.url));
+                Choice::History { url: p.url, title: p.title, icon }
+            })
+            .collect()
+    }
+
+    /// `??`: history alone, open pages included (nothing typed: the latest).
+    fn history_only(&mut self, words: &str) -> Vec<Choice> {
+        let pages = if words.is_empty() { self.db.recent(50) } else { self.db.search(words, 50) };
+        pages
+            .into_iter()
             .map(|p| {
                 let icon = self.cached_favicon(url::host(&p.url));
                 Choice::History { url: p.url, title: p.title, icon }
@@ -320,7 +340,7 @@ impl Workspace {
                 _ => self.reveal_pane(pane, window, cx),
             },
             Choice::Open(address) | Choice::History { url: address, .. } => self.open_for(intent, &address, window, cx),
-            Choice::Search(words) => self.open_for(intent, &url::resolve(&words), window, cx),
+            Choice::Search(words) => self.open_for(intent, &url::search(&words), window, cx),
             Choice::Command(i) => {
                 // Back to the page first; the command may open the palette again.
                 self.close_palette_focus(window, cx);

@@ -24,7 +24,24 @@ pub(crate) enum PageEvent {
     Progress(f64),
     Fullscreen(bool),
     /// The page asked for a new window; it opens as a space.
-    OpenTab { url: String, background: bool },
+    /// `alternate`: Shift was held, for the other of a space and a tile.
+    OpenTab { url: String, background: bool, alternate: bool },
+    /// The page opened a window it keeps a hold of (`window.open`): a page
+    /// the engine made, which a new view takes (see [`Popup`]).
+    #[cfg_attr(not(any(gate_wpe, windows)), allow(dead_code))]
+    Popup(Popup),
+    /// The page's script closed its window (`window.close()`).
+    #[cfg_attr(not(any(gate_wpe, windows)), allow(dead_code))]
+    CloseRequested,
+    /// A download the page started began, moved on or ended.
+    Download(crate::Download),
+    /// The page showed a notification.
+    Notification(crate::Notification),
+    /// The page took its notification back (`notification.close()`).
+    NotificationClosed(u64),
+    /// The page's right-click menu, at a point in the page (see
+    /// [`Page::choose_context`]).
+    ContextMenu(crate::ContextMenu),
     /// The question the page now waits on, or none.
     Ask(Option<Ask>),
     Media { camera: bool, microphone: bool },
@@ -58,6 +75,42 @@ pub(crate) enum PageEvent {
 }
 
 pub(crate) type Events = async_channel::Sender<PageEvent>;
+
+/// A page an engine opened for another one's `window.open`, which keeps
+/// its opener (and so a hold of it), with the channel it reports on: a new
+/// [`crate::WebView`] takes it (see [`crate::WebView::popup`]).
+pub struct Popup {
+    pub(crate) events: Events,
+    pub(crate) receiver: async_channel::Receiver<PageEvent>,
+    pub(crate) page: PopupPage,
+}
+
+impl Popup {
+    pub(crate) fn new(page: impl FnOnce(Events) -> PopupPage) -> Self {
+        let (events, receiver) = async_channel::unbounded();
+        Self { page: page(events.clone()), events, receiver }
+    }
+}
+
+/// The engine's part of a [`Popup`].
+pub(crate) enum PopupPage {
+    #[cfg(gate_wpe)]
+    Wpe(wpe::Opened),
+    /// Kept by the engine (pages aren't `Send`) under this key.
+    #[cfg(windows)]
+    WebView2(u64),
+}
+
+/// The engine page of a [`Popup`], for the view that takes it (none if it
+/// went away meanwhile).
+pub(crate) fn adopt(page: PopupPage) -> Option<Box<dyn Page>> {
+    match page {
+        #[cfg(gate_wpe)]
+        PopupPage::Wpe(opened) => Some(Box::new(wpe::WpePage::adopt(opened))),
+        #[cfg(windows)]
+        PopupPage::WebView2(key) => webview2::WebView2Page::adopt(key).map(|page| Box::new(page) as Box<dyn Page>),
+    }
+}
 
 /// A select's menu: its options, below the select at `at` (page coordinates).
 #[derive(Clone, Debug)]
@@ -129,6 +182,14 @@ pub(crate) trait Page {
     /// typed for a prompt.
     fn answer(&mut self, accept: bool, input: Option<&str>);
     fn show_dev_tools(&mut self);
+    /// Runs the right-click menu's item, or none (it closes).
+    fn choose_context(&mut self, _index: Option<usize>) {}
+    /// Stops a download the page started.
+    fn cancel_download(&mut self, _id: u64) {}
+    /// The user clicked the page's notification (its `click` event).
+    fn notification_clicked(&mut self, _id: u64) {}
+    /// The user dismissed the page's notification (its `close` event).
+    fn notification_closed(&mut self, _id: u64) {}
     fn close(&mut self);
     /// Draws the page at `bounds` (engines whose pages GPUI paints) or puts
     /// its native view there (engines that present pages themselves).

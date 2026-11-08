@@ -8,7 +8,7 @@
 
 mod instance;
 
-use crate::engine::{Button, Events, Input, Page, PageEvent};
+use crate::engine::{Button, Events, Input, Page, PageEvent, Popup, PopupPage};
 use crate::{Ask, Playback, Started, Zoom};
 use anyhow::{Context as _, Result};
 use gpui::{Bounds, Corners, CursorStyle, Keystroke, Modifiers, Pixels, RenderImage, ScrollDelta, Window};
@@ -59,6 +59,9 @@ struct Engine {
     sweep_queued: bool,
     /// Windows whose system drags go to their pages (see [`native_drag`]).
     drag_windows: Vec<isize>,
+    /// Windows pages opened, until their views take them (see [`Popup`]).
+    popups: HashMap<u64, WebView2Page>,
+    next_popup: u64,
 }
 
 thread_local! {
@@ -407,6 +410,8 @@ fn current_frame() -> u64 {
 enum Pending {
     Dialog(ICoreWebView2ScriptDialogOpeningEventArgs, ICoreWebView2Deferral),
     Permission(ICoreWebView2PermissionRequestedEventArgs, ICoreWebView2Deferral),
+    /// A window the page opened without a click, held until allowed.
+    Popup(ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2Deferral),
 }
 
 /// The COM objects of a created page.
@@ -468,6 +473,8 @@ pub(crate) struct Host {
     /// The last press was a middle click or held Ctrl: a window it opens
     /// goes behind.
     background_click: Cell<bool>,
+    /// And Shift was held (see [`PageEvent::OpenTab`]).
+    alternate_click: Cell<bool>,
     loading: Cell<bool>,
     reported: RefCell<Reported>,
     ask: RefCell<Option<Pending>>,
@@ -475,6 +482,17 @@ pub(crate) struct Host {
     media: RefCell<HashMap<String, Playback>>,
     /// The page's frames, to hand media commands to their watchers.
     frames: RefCell<Vec<ICoreWebView2Frame2>>,
+    /// For a window a page opened: the opener's request, which this page
+    /// answers once it exists (see [`Host::open_popup`]).
+    opened_by: RefCell<Option<(ICoreWebView2NewWindowRequestedEventArgs, ICoreWebView2Deferral)>>,
+    /// Downloads the page started, by Gate's id, and when each last reported.
+    downloads: RefCell<HashMap<u64, (ICoreWebView2DownloadOperation, std::time::Instant)>>,
+    /// Notifications the page showed, by Gate's id.
+    notifications: RefCell<HashMap<u64, ICoreWebView2Notification>>,
+    next_id: Cell<u64>,
+    /// The right-click menu Gate shows: Edge's request, held until an item
+    /// is chosen, and each item's command (none for separators).
+    context: RefCell<Option<(ICoreWebView2ContextMenuRequestedEventArgs, ICoreWebView2Deferral, Vec<Option<i32>>)>>,
 }
 
 pub(crate) struct WebView2Page {
@@ -505,11 +523,24 @@ impl WebView2Page {
         if first {
             window.on_native_drag(move |drag| native_drag(hwnd, drag));
         }
+        let host = Host::new(events, hwnd, Some(url.to_string()));
+        Host::create(&host);
+        Self { host }
+    }
+
+    /// A window a page opened (see [`Host::open_popup`]).
+    pub(crate) fn adopt(key: u64) -> Option<Self> {
+        ENGINE.with_borrow_mut(|e| e.popups.remove(&key))
+    }
+}
+
+impl Host {
+    fn new(events: Events, hwnd: HWND, url: Option<String>) -> Rc<Self> {
         let host = Rc::new(Host {
             events,
             hwnd,
             native: RefCell::new(None),
-            pending_url: RefCell::new(Some(url.to_string())),
+            pending_url: RefCell::new(url),
             hidden: Cell::new(false),
             has_area: Cell::new(false),
             focused: Cell::new(false),
@@ -519,19 +550,54 @@ impl WebView2Page {
             pressed: Cell::new(0),
             hovered: Cell::new(false),
             background_click: Cell::new(false),
+            alternate_click: Cell::new(false),
             loading: Cell::new(true),
             reported: RefCell::new(Reported::default()),
             ask: RefCell::new(None),
             media: RefCell::new(HashMap::new()),
             frames: RefCell::new(Vec::new()),
+            opened_by: RefCell::new(None),
+            downloads: RefCell::new(HashMap::new()),
+            notifications: RefCell::new(HashMap::new()),
+            next_id: Cell::new(1),
+            context: RefCell::new(None),
         });
         ENGINE.with_borrow_mut(|e| e.pages.push(Rc::downgrade(&host)));
-        Host::create(&host);
-        Self { host }
+        host
     }
-}
 
-impl Host {
+    /// A window the page asked for that it keeps a hold of (`window.open`):
+    /// Edge's request waits until a page of Gate's exists to answer it,
+    /// which a new view takes as a space.
+    fn open_popup(opener: &Rc<Self>, args: ICoreWebView2NewWindowRequestedEventArgs, deferral: ICoreWebView2Deferral) {
+        let popup = Popup::new(|events| {
+            let host = Host::new(events, opener.hwnd, None);
+            *host.opened_by.borrow_mut() = Some((args, deferral));
+            Host::create(&host);
+            let key = ENGINE.with_borrow_mut(|e| {
+                e.next_popup += 1;
+                e.popups.insert(e.next_popup, WebView2Page { host });
+                e.next_popup
+            });
+            PopupPage::WebView2(key)
+        });
+        opener.push(PageEvent::Popup(popup));
+    }
+
+    /// Answers the opener's request (see [`Host::open_popup`]) with this
+    /// page, or with none (`window.open` returns null).
+    fn answer_opener(&self, webview: Option<&ICoreWebView2>) {
+        let Some((args, deferral)) = self.opened_by.borrow_mut().take() else { return };
+        // SAFETY: COM calls on the live request.
+        unsafe {
+            if let Some(webview) = webview
+                && let Err(error) = args.SetNewWindow(webview)
+            {
+                tracing::warn!("Edge (WebView2): the opened window lost its opener: {error}");
+            }
+            let _ = deferral.Complete();
+        }
+    }
     fn push(&self, event: PageEvent) {
         let _ = self.events.try_send(event);
     }
@@ -561,6 +627,7 @@ impl Host {
             let Some(host) = weak.upgrade() else { return Ok(()) };
             match result.and_then(|()| composition.ok_or_else(windows::core::Error::empty)) {
                 Ok(composition) if host.closed.get() => {
+                    host.answer_opener(None);
                     if let Ok(controller) = composition.cast::<ICoreWebView2Controller>() {
                         // SAFETY: closing a controller nothing else holds.
                         let _ = unsafe { controller.Close() };
@@ -581,6 +648,7 @@ impl Host {
 
     fn fail(&self, message: &str) {
         tracing::error!("Edge (WebView2) page failed: {message}");
+        self.answer_opener(None);
         self.loading.set(false);
         self.report_loading();
         self.push(PageEvent::Crashed);
@@ -605,6 +673,8 @@ impl Host {
             Host::listen(host, &webview, &composition, &controller)?;
         }
         add_extensions(&webview);
+        // A window a page opened: it loads what the opener asked for.
+        host.answer_opener(Some(&webview));
         *host.native.borrow_mut() = Some(Native {
             environment: environment.clone(),
             composition,
@@ -716,8 +786,19 @@ impl Host {
                 &mut token,
             )?;
             let weak = Rc::downgrade(host);
+            // Script closed a window it opened (`window.close()`).
+            webview.add_WindowCloseRequested(
+                &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                    if let Some(host) = weak.upgrade() {
+                        host.push(PageEvent::CloseRequested);
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+            let weak = Rc::downgrade(host);
             webview.add_NewWindowRequested(
-                &NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
+                &NewWindowRequestedEventHandler::create(Box::new(move |sender, args| {
                     let (Some(host), Some(args)) = (weak.upgrade(), args) else { return Ok(()) };
                     // Gate opens it as a space; Edge opens no window of its own.
                     args.SetHandled(true)?;
@@ -726,11 +807,26 @@ impl Host {
                     let mut uri = PWSTR::null();
                     args.Uri(&mut uri)?;
                     let url = take_pwstr(uri);
-                    // WebView2 has no popup blocker: only what a click opened.
-                    if clicked.as_bool() && !url.is_empty() {
-                        host.push(PageEvent::OpenTab { url, background: host.background_click.get() });
+                    // WebView2 has no popup blocker: what a click opened
+                    // opens, anything else waits for the user's answer.
+                    if !clicked.as_bool() {
+                        tracing::info!("Edge (WebView2): asking about a popup ({url})");
+                        let mut source = PWSTR::null();
+                        if let Some(sender) = sender {
+                            sender.Source(&mut source)?;
+                        }
+                        let origin = origin_of(&take_pwstr(source));
+                        let deferral = args.GetDeferral()?;
+                        host.replace_ask(Some(Pending::Popup(args.clone(), deferral)));
+                        host.push(PageEvent::Ask(Some(Ask::Permission { origin, what: vec!["a pop-up window"] })));
+                    } else if host.background_click.get() {
+                        // A middle or Ctrl+click: the link, as a space behind.
+                        if !url.is_empty() {
+                            host.push(PageEvent::OpenTab { url, background: true, alternate: host.alternate_click.get() });
+                        }
                     } else {
-                        tracing::info!("Edge (WebView2): blocked a popup ({url})");
+                        // Edge's own page, so the opener keeps its hold of it.
+                        Host::open_popup(&host, args.clone(), args.GetDeferral()?);
                     }
                     Ok(())
                 })),
@@ -819,6 +915,9 @@ impl Host {
                 &mut token,
             )?;
             Host::watch_media(host, webview)?;
+            Host::watch_downloads(host, webview)?;
+            Host::watch_context_menu(host, webview)?;
+            Host::watch_notifications(host, webview)?;
             if let Ok(webview15) = webview.cast::<ICoreWebView2_15>() {
                 let weak = Rc::downgrade(host);
                 webview15.add_FaviconChanged(
@@ -887,6 +986,225 @@ impl Host {
                         args.SetHandled(true)?;
                         host.push(PageEvent::Key(keystroke));
                     }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Downloads go to the Downloads folder (see [`crate::download_path`]),
+    /// shown by Gate instead of Edge's download box.
+    fn watch_downloads(host: &Rc<Self>, webview: &ICoreWebView2) -> windows::core::Result<()> {
+        let Ok(webview4) = webview.cast::<ICoreWebView2_4>() else { return Ok(()) };
+        let weak = Rc::downgrade(host);
+        let mut token = 0;
+        // SAFETY: COM calls on the live page and its event arguments.
+        unsafe {
+            webview4.add_DownloadStarting(
+                &DownloadStartingEventHandler::create(Box::new(move |_, args| {
+                    let (Some(host), Some(args)) = (weak.upgrade(), args) else { return Ok(()) };
+                    let mut edge = PWSTR::null();
+                    args.ResultFilePath(&mut edge)?;
+                    let edge = take_pwstr(edge);
+                    let name = Path::new(&edge).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let path = crate::download_path(&name);
+                    args.SetResultFilePath(&HSTRING::from(path.as_os_str()))?;
+                    args.SetHandled(true)?;
+                    let operation = args.DownloadOperation()?;
+                    let id = host.next_id.replace(host.next_id.get() + 1);
+                    host.downloads.borrow_mut().insert(id, (operation.clone(), std::time::Instant::now()));
+                    host.report_download(id, &operation);
+                    let mut token = 0;
+                    let weak = Rc::downgrade(&host);
+                    operation.add_BytesReceivedChanged(
+                        &BytesReceivedChangedEventHandler::create(Box::new(move |_, _| {
+                            let Some(host) = weak.upgrade() else { return Ok(()) };
+                            // A few reports a second, not one per chunk.
+                            let operation = {
+                                let mut downloads = host.downloads.borrow_mut();
+                                let Some((operation, last)) = downloads.get_mut(&id) else { return Ok(()) };
+                                if last.elapsed() < std::time::Duration::from_millis(250) {
+                                    return Ok(());
+                                }
+                                *last = std::time::Instant::now();
+                                operation.clone()
+                            };
+                            host.report_download(id, &operation);
+                            Ok(())
+                        })),
+                        &mut token,
+                    )?;
+                    let weak = Rc::downgrade(&host);
+                    operation.add_StateChanged(
+                        &StateChangedEventHandler::create(Box::new(move |_, _| {
+                            let Some(host) = weak.upgrade() else { return Ok(()) };
+                            let operation = host.downloads.borrow().get(&id).map(|(o, _)| o.clone());
+                            if let Some(operation) = operation
+                                && host.report_download(id, &operation) != crate::DownloadState::Running
+                            {
+                                host.downloads.borrow_mut().remove(&id);
+                            }
+                            Ok(())
+                        })),
+                        &mut token,
+                    )?;
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Tells Gate where a download is; returns its state.
+    fn report_download(&self, id: u64, operation: &ICoreWebView2DownloadOperation) -> crate::DownloadState {
+        // SAFETY: COM calls on the live download.
+        unsafe {
+            let (mut received, mut total) = (0i64, 0i64);
+            let _ = operation.BytesReceived(&mut received);
+            let _ = operation.TotalBytesToReceive(&mut total);
+            let mut path = PWSTR::null();
+            let _ = operation.ResultFilePath(&mut path);
+            let path = PathBuf::from(take_pwstr(path));
+            let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
+            let _ = operation.State(&mut state);
+            let state = match state {
+                COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED => crate::DownloadState::Done,
+                COREWEBVIEW2_DOWNLOAD_STATE_INTERRUPTED => {
+                    let mut reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
+                    let _ = operation.InterruptReason(&mut reason);
+                    if reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED {
+                        crate::DownloadState::Cancelled
+                    } else {
+                        crate::DownloadState::Failed(format!("interrupted ({})", reason.0))
+                    }
+                }
+                _ => crate::DownloadState::Running,
+            };
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.push(PageEvent::Download(crate::Download {
+                id,
+                name,
+                path,
+                received: received.max(0) as u64,
+                total: (total > 0).then_some(total as u64),
+                state: state.clone(),
+            }));
+            state
+        }
+    }
+
+    /// The page's right-click menu, drawn by Gate where the pointer is
+    /// (Edge's own lands off where Gate places the page); Edge runs the
+    /// command chosen.
+    fn watch_context_menu(host: &Rc<Self>, webview: &ICoreWebView2) -> windows::core::Result<()> {
+        let Ok(webview11) = webview.cast::<ICoreWebView2_11>() else { return Ok(()) };
+        let weak = Rc::downgrade(host);
+        let mut token = 0;
+        // SAFETY: COM calls on the live page and its event arguments.
+        unsafe {
+            webview11.add_ContextMenuRequested(
+                &ContextMenuRequestedEventHandler::create(Box::new(move |_, args| {
+                    let (Some(host), Some(args)) = (weak.upgrade(), args) else { return Ok(()) };
+                    host.close_context_menu(None);
+                    let collection = args.MenuItems()?;
+                    let mut count = 0u32;
+                    collection.Count(&mut count)?;
+                    let (mut items, mut commands) = (Vec::new(), Vec::new());
+                    for i in 0..count {
+                        let item = collection.GetValueAtIndex(i)?;
+                        let mut kind = COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND::default();
+                        item.Kind(&mut kind)?;
+                        if kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SUBMENU {
+                            continue;
+                        }
+                        if kind == COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR {
+                            // None first, none twice.
+                            if !matches!(items.last(), None | Some(crate::ContextMenuItem::Separator)) {
+                                items.push(crate::ContextMenuItem::Separator);
+                                commands.push(None);
+                            }
+                            continue;
+                        }
+                        let (mut label, mut enabled, mut command) = (PWSTR::null(), windows::core::BOOL::default(), 0i32);
+                        item.Label(&mut label)?;
+                        item.IsEnabled(&mut enabled)?;
+                        item.CommandId(&mut command)?;
+                        // "&Back" -> "Back" ("&&" is an ampersand).
+                        let label = take_pwstr(label).replace("&&", "\u{0}").replace('&', "").replace('\u{0}', "&");
+                        items.push(crate::ContextMenuItem::Command { label, enabled: enabled.as_bool() });
+                        commands.push(Some(command));
+                    }
+                    if matches!(items.last(), Some(crate::ContextMenuItem::Separator)) {
+                        items.pop();
+                        commands.pop();
+                    }
+                    if items.is_empty() {
+                        return Ok(());
+                    }
+                    // In the page's own units already: Edge renders at the
+                    // display's scale (`SetRasterizationScale`).
+                    let mut at = POINT::default();
+                    args.Location(&mut at)?;
+                    let at = gpui::point(gpui::px(at.x as f32), gpui::px(at.y as f32));
+                    let deferral = args.GetDeferral()?;
+                    args.SetHandled(true)?;
+                    *host.context.borrow_mut() = Some((args.clone(), deferral, commands));
+                    host.push(PageEvent::ContextMenu(crate::ContextMenu { at, items }));
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Answers the right-click menu: the item at `index` runs, or none.
+    fn close_context_menu(&self, index: Option<usize>) {
+        let Some((args, deferral, commands)) = self.context.borrow_mut().take() else { return };
+        // SAFETY: COM calls on the held request.
+        unsafe {
+            if let Some(Some(command)) = index.and_then(|i| commands.get(i)) {
+                let _ = args.SetSelectedCommandId(*command);
+            }
+            let _ = deferral.Complete();
+        }
+    }
+
+    /// The page's notifications, shown by Gate instead of Edge.
+    fn watch_notifications(host: &Rc<Self>, webview: &ICoreWebView2) -> windows::core::Result<()> {
+        let Ok(webview24) = webview.cast::<ICoreWebView2_24>() else { return Ok(()) };
+        let weak = Rc::downgrade(host);
+        let mut token = 0;
+        // SAFETY: COM calls on the live page and its event arguments.
+        unsafe {
+            webview24.add_NotificationReceived(
+                &NotificationReceivedEventHandler::create(Box::new(move |_, args| {
+                    let (Some(host), Some(args)) = (weak.upgrade(), args) else { return Ok(()) };
+                    args.SetHandled(true)?;
+                    let notification = args.Notification()?;
+                    let (mut title, mut body) = (PWSTR::null(), PWSTR::null());
+                    notification.Title(&mut title)?;
+                    notification.Body(&mut body)?;
+                    let id = host.next_id.replace(host.next_id.get() + 1);
+                    let mut token = 0;
+                    let weak = Rc::downgrade(&host);
+                    // The page took it back.
+                    notification.add_CloseRequested(
+                        &NotificationCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                            if let Some(host) = weak.upgrade() {
+                                host.notifications.borrow_mut().remove(&id);
+                                host.push(PageEvent::NotificationClosed(id));
+                            }
+                            Ok(())
+                        })),
+                        &mut token,
+                    )?;
+                    let _ = notification.ReportShown();
+                    host.notifications.borrow_mut().insert(id, notification);
+                    host.push(PageEvent::Notification(crate::Notification { id, title: take_pwstr(title), body: take_pwstr(body) }));
                     Ok(())
                 })),
                 &mut token,
@@ -1263,6 +1581,11 @@ fn answer_pending(pending: Pending, accept: bool, input: Option<&str>) {
                 let _ = args.SetState(if accept { COREWEBVIEW2_PERMISSION_STATE_ALLOW } else { COREWEBVIEW2_PERMISSION_STATE_DENY });
                 let _ = deferral.Complete();
             }
+            // Not allowed: `window.open` gets no window (see
+            // `WebView2Page::answer` for allowed).
+            Pending::Popup(_, deferral) => {
+                let _ = deferral.Complete();
+            }
         }
     }
 }
@@ -1325,6 +1648,7 @@ impl Page for WebView2Page {
                     Button::Middle => (4, COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN),
                 };
                 host.background_click.set(button == Button::Middle || modifiers.control);
+                host.alternate_click.set(modifiers.shift);
                 host.pressed.set(host.pressed.get() | bit);
                 host.hovered.set(true);
                 host.mouse(kind, 0, at, &modifiers);
@@ -1419,10 +1743,39 @@ impl Page for WebView2Page {
 
     fn answer(&mut self, accept: bool, input: Option<&str>) {
         let pending = self.host.ask.borrow_mut().take();
-        if let Some(pending) = pending {
-            answer_pending(pending, accept, input);
+        match pending {
+            // Allowed, the popup opens as a clicked one does.
+            Some(Pending::Popup(args, deferral)) if accept => Host::open_popup(&self.host, args, deferral),
+            Some(pending) => answer_pending(pending, accept, input),
+            None => {}
         }
         self.host.push(PageEvent::Ask(None));
+    }
+
+    fn choose_context(&mut self, index: Option<usize>) {
+        self.host.close_context_menu(index);
+    }
+
+    fn cancel_download(&mut self, id: u64) {
+        let operation = self.host.downloads.borrow().get(&id).map(|(o, _)| o.clone());
+        if let Some(operation) = operation {
+            // SAFETY: a COM call on the live download.
+            let _ = unsafe { operation.Cancel() };
+        }
+    }
+
+    fn notification_clicked(&mut self, id: u64) {
+        if let Some(notification) = self.host.notifications.borrow().get(&id) {
+            // SAFETY: a COM call on the live notification.
+            let _ = unsafe { notification.ReportClicked() };
+        }
+    }
+
+    fn notification_closed(&mut self, id: u64) {
+        if let Some(notification) = self.host.notifications.borrow_mut().remove(&id) {
+            // SAFETY: a COM call on the live notification.
+            let _ = unsafe { notification.ReportClosed() };
+        }
     }
 
     fn show_dev_tools(&mut self) {

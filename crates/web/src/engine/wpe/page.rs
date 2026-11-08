@@ -51,17 +51,29 @@ impl WpePage {
     pub(crate) fn new(url: &str, events: Events, window: &mut Window) -> Self {
         let (worker, id, route) = super::add_page(events, window.dmabuf_target());
         worker.send(id, json!({"cmd":"create"}));
+        let page = Self::with(worker, id, route);
+        page.send(json!({"cmd":"load","url":url}));
+        page
+    }
+
+    /// The page the helper opened for another (`window.open`), loading
+    /// what its opener asked for.
+    pub(crate) fn adopt(opened: super::Opened) -> Self {
+        // The helper that opened it is the one running.
+        let worker = super::worker().expect("a page the helper opened has a helper");
+        Self::with(worker, opened.id, opened.route)
+    }
+
+    fn with(worker: Arc<Worker>, id: u32, route: Arc<Route>) -> Self {
         let presenter = Presenter::new(worker.outbox.clone(), id);
-        let page = Self {
+        Self {
             worker,
             route,
             id,
             shown: Rc::new(RefCell::new(Shown { presenter, image: None, hidden: false, closed: false })),
             geometry: None,
             active: None,
-        };
-        page.send(json!({"cmd":"load","url":url}));
-        page
+        }
     }
 
     fn send(&self, command: Value) {
@@ -286,6 +298,22 @@ impl Page for WpePage {
 
     fn show_dev_tools(&mut self) {
         tracing::info!("WPE WebKit: developer tools are not available yet");
+    }
+
+    fn choose_context(&mut self, index: Option<usize>) {
+        self.send(json!({"cmd":"context","index":index.map_or(-1, |i| i as i64)}));
+    }
+
+    fn cancel_download(&mut self, id: u64) {
+        self.send(json!({"cmd":"cancel-download","download":id}));
+    }
+
+    fn notification_clicked(&mut self, id: u64) {
+        self.send(json!({"cmd":"notification-clicked","notification":id}));
+    }
+
+    fn notification_closed(&mut self, id: u64) {
+        self.send(json!({"cmd":"notification-closed","notification":id}));
     }
 
     fn close(&mut self) {

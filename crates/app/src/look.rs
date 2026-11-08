@@ -131,6 +131,28 @@ impl Workspace {
         LookUi { colors, folder, sliders: Rc::default(), _events: events }
     }
 
+    /// Picks the wallpaper folder with the system's folder picker.
+    fn browse_wallpaper_dir(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Use folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(dir) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |ws, cx| {
+                ws.store.set(|s| s.wallpaper_dir = Some(dir.clone()));
+                if let Some(look) = ws.settings.as_ref().map(|d| d.look.folder.clone()) {
+                    look.update(cx, |input, cx| input.set_text(dir.display().to_string(), cx));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The custom colors, once they read as 2 or 3 colors.
     fn apply_custom_colors(&mut self, cx: &mut Context<Self>) {
         let Some(look) = self.settings.as_ref().map(|d| &d.look) else { return };
@@ -378,15 +400,25 @@ impl Workspace {
                         div()
                             .flex()
                             .items_center()
-                            .w(px(240.))
-                            .h(px(28.))
-                            .px(px(8.))
-                            .rounded(px(6.))
-                            .bg(theme::wash(0.05))
-                            .border_1()
-                            .border_color(theme::border())
-                            .text_size(px(12.))
-                            .child(folder)
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .w(px(220.))
+                                    .h(px(28.))
+                                    .px(px(8.))
+                                    .rounded(px(6.))
+                                    .bg(theme::wash(0.05))
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .text_size(px(12.))
+                                    .child(folder),
+                            )
+                            .child(
+                                crate::render::text_button("settings-wallpaper-browse", "Browse\u{2026}", false)
+                                    .on_click(cx.listener(|this, _, _, cx| this.browse_wallpaper_dir(cx))),
+                            )
                             .into_any_element(),
                     ));
                 }
