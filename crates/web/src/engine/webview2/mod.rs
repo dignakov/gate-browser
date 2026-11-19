@@ -54,9 +54,12 @@ struct Engine {
     relaunch: Option<Rc<dyn Fn(Vec<String>, &mut gpui::App)>>,
     /// Gate's own shortcuts: pressed in a page, they go to Gate.
     shortcuts: Vec<Keystroke>,
-    /// Counts presented frames; see [`sweep`].
+    /// Counts drawn frames with pages; see [`queue_sweep`].
     frame: u64,
-    sweep_queued: bool,
+    /// The drawn frame's sweep, until it runs. Dropped with a frame that is
+    /// never presented (the window's first draw is one), so the next frame
+    /// queues its own.
+    sweep: Weak<Cell<bool>>,
     /// Windows whose system drags go to their pages (see [`native_drag`]).
     drag_windows: Vec<isize>,
     /// Windows pages opened, until their views take them (see [`Popup`]).
@@ -259,15 +262,25 @@ fn add_extensions(webview: &ICoreWebView2) {
 
 /// After a presented frame, unmounts pages it didn't paint: a pane not drawn
 /// (another's zoomed over it, its space left) mustn't stay on screen. Queued
-/// by the first page painted in a frame; runs before the pages' own updates.
-fn queue_sweep(window: &mut Window) {
-    let queue = ENGINE.with_borrow_mut(|e| !std::mem::replace(&mut e.sweep_queued, true));
+/// by the first page painted in a frame, which then counts as a new frame;
+/// runs before the pages' own updates. Presenting the frame again runs it
+/// again, for the same frame.
+fn queue_sweep(window: &mut Window) -> u64 {
+    let (queue, frame) = ENGINE.with_borrow_mut(|e| {
+        let queue = e.sweep.upgrade().is_none_or(|pending| !pending.get());
+        if queue {
+            e.frame += 1;
+        }
+        (queue, e.frame)
+    });
     if queue {
-        window.on_present(|| {
-            let (frame, pages) = ENGINE.with_borrow_mut(|e| {
-                e.sweep_queued = false;
+        let pending = Rc::new(Cell::new(true));
+        ENGINE.with_borrow_mut(|e| e.sweep = Rc::downgrade(&pending));
+        window.on_present(move || {
+            pending.set(false);
+            let pages = ENGINE.with_borrow_mut(|e| {
                 e.pages.retain(|p| p.strong_count() > 0);
-                (e.frame, e.pages.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
+                e.pages.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
             });
             for host in pages {
                 if host.painted.get() != frame {
@@ -275,9 +288,9 @@ fn queue_sweep(window: &mut Window) {
                     host.update_visibility();
                 }
             }
-            ENGINE.with_borrow_mut(|e| e.frame += 1);
         });
     }
+    frame
 }
 
 /// A system drag over a window with pages: the data, and the page it's over.
@@ -790,6 +803,7 @@ impl Host {
             webview.add_WindowCloseRequested(
                 &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
                     if let Some(host) = weak.upgrade() {
+                        tracing::info!("Edge (WebView2): the page closed itself ({} downloads under way)", host.downloads.borrow().len());
                         host.push(PageEvent::CloseRequested);
                     }
                     Ok(())
@@ -981,8 +995,9 @@ impl Host {
                     let shortcut = keystroke.as_ref().is_some_and(|keystroke| {
                         ENGINE.with_borrow(|e| e.shortcuts.iter().any(|k| k.modifiers == keystroke.modifiers && k.key == keystroke.key))
                     });
-                    tracing::debug!("Edge (WebView2): key 0x{key:02x} in a page: {:?}, Gate's: {shortcut}", keystroke.as_ref().map(|k| k.unparse()));
+                    // Only Gate's shortcuts are logged, never what is typed.
                     if let Some(keystroke) = keystroke.filter(|_| shortcut) {
+                        tracing::debug!("Edge (WebView2): Gate's shortcut {} in a page", keystroke.unparse());
                         args.SetHandled(true)?;
                         host.push(PageEvent::Key(keystroke));
                     }
@@ -1010,6 +1025,7 @@ impl Host {
                     let edge = take_pwstr(edge);
                     let name = Path::new(&edge).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let path = crate::download_path(&name);
+                    tracing::info!("Edge (WebView2): download starting, to {}", path.display());
                     args.SetResultFilePath(&HSTRING::from(path.as_os_str()))?;
                     args.SetHandled(true)?;
                     let operation = args.DownloadOperation()?;
@@ -1529,17 +1545,33 @@ impl Host {
         let Some(native) = native.as_mut() else { return };
         // SAFETY: COM calls on the live page and its visual.
         unsafe {
+            if native.shown != Some(visible) || native.mounted != visible {
+                let mut source = PWSTR::null();
+                let url = if native.webview.Source(&mut source).is_ok() { take_pwstr(source) } else { String::new() };
+                tracing::debug!(
+                    "Edge (WebView2): page {} (hidden {}, area {}, mounted {}, frame {}, painted {}) {url}",
+                    if visible { "shown" } else { "taken off" },
+                    self.hidden.get(),
+                    self.has_area.get(),
+                    native.mounted,
+                    current_frame(),
+                    self.painted.get(),
+                );
+            }
             if native.shown.replace(visible) != Some(visible) {
                 let _ = native.controller.SetIsVisible(visible);
             }
             if let Some(mount) = &native.visual
                 && native.mounted != visible
             {
-                let _ = if visible {
+                let result = if visible {
                     mount.layer.AddVisual(&mount.visual, true, None::<&IDCompositionVisual>)
                 } else {
                     mount.layer.RemoveVisual(&mount.visual)
                 };
+                if let Err(error) = result {
+                    tracing::warn!("Edge (WebView2): page visual not {}: {error}", if visible { "added" } else { "removed" });
+                }
                 native.mounted = visible;
             }
         }
@@ -1814,8 +1846,7 @@ impl Page for WebView2Page {
             scale,
         };
         let has_area = f32::from(visible.size.width) > 0. && f32::from(visible.size.height) > 0.;
-        self.host.painted.set(current_frame());
-        queue_sweep(window);
+        self.host.painted.set(queue_sweep(window));
         let composition = window.native_composition();
         let host = Rc::downgrade(&self.host);
         window.on_present(move || {

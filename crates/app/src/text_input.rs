@@ -130,6 +130,11 @@ impl TextInput {
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        // At the end already: for whatever holds the field (the palette
+        // lists a page's spaces).
+        if self.selected_range.is_empty() && self.selected_range.end == self.content.len() {
+            return cx.propagate();
+        }
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), cx);
         } else {

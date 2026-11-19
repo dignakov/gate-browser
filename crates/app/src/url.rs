@@ -36,6 +36,19 @@ pub fn is_address(input: &str) -> bool {
     has_scheme(text) || (!text.is_empty() && !text.contains(char::is_whitespace) && looks_like_host(text))
 }
 
+/// Whether `url` is at the typed address or under it: `foxglove.dev`
+/// takes in `https://www.foxglove.dev/docs`, not `github.com/foxglove`.
+pub fn is_under(url: &str, typed: &str) -> bool {
+    fn bare(s: &str) -> String {
+        let s = s.trim().split_once("://").map_or(s.trim(), |(_, r)| r);
+        s.strip_prefix("www.").unwrap_or(s).trim_end_matches('/').to_lowercase()
+    }
+    let (url, typed) = (bare(url), bare(typed));
+    !typed.is_empty()
+        && url.starts_with(&typed)
+        && url[typed.len()..].chars().next().is_none_or(|c| matches!(c, '/' | '?' | '#' | ':'))
+}
+
 /// How a URL shows in the address bar: blank pages show nothing.
 pub fn display(url: &str) -> String {
     if url == START || url.is_empty() { String::new() } else { url.to_string() }
@@ -90,6 +103,16 @@ fn encode(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn under() {
+        assert!(is_under("https://foxglove.dev/", "foxglove.dev"));
+        assert!(is_under("https://www.foxglove.dev/docs", "foxglove.dev"));
+        assert!(is_under("https://foxglove.dev/docs/studio", "https://foxglove.dev/docs"));
+        assert!(!is_under("https://github.com/foxglove/studio", "foxglove.dev"));
+        assert!(!is_under("https://foxglove.dev.evil.com/", "foxglove.dev"));
+        assert!(!is_under("https://foxglove.dev/", ""));
+    }
 
     #[test]
     fn resolves() {

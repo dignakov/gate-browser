@@ -172,6 +172,25 @@ impl Db {
         rows.collect()
     }
 
+    /// What a site calls itself: short titles its pages had ("Gmail" on
+    /// mail.google.com, whose inbox is titled by account).
+    pub fn site_names(&self, host: &str) -> Vec<String> {
+        let patterns = ["https://", "http://", "https://www.", "http://www."].map(|scheme| format!("{scheme}{host}/%"));
+        let result = self.conn.prepare_cached(
+            "SELECT DISTINCT title FROM pages WHERE (url LIKE ?1 OR url LIKE ?2 OR url LIKE ?3 OR url LIKE ?4)
+             AND length(title) BETWEEN 2 AND 24 LIMIT 20",
+        )
+        .and_then(|mut s| s.query_map(params![patterns[0], patterns[1], patterns[2], patterns[3]], |r| r.get::<_, String>(0))?.collect());
+        result.unwrap_or_else(|error: rusqlite::Error| {
+            tracing::warn!("reading site names: {error}");
+            Vec::new()
+        })
+        .into_iter()
+        // A few words, and not the address itself.
+        .filter(|t| t.split_whitespace().count() <= 3 && !t.contains(host))
+        .collect()
+    }
+
     pub fn favicon(&self, host: &str) -> Option<Vec<u8>> {
         self.conn.query_row("SELECT png FROM favicons WHERE host = ?1", [host], |r| r.get(0)).optional().ok().flatten()
     }

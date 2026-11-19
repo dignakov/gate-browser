@@ -30,6 +30,11 @@ pub struct Settings {
     /// Links opened beside (middle or Ctrl+click) become tiles of the
     /// space, placed in a spiral, not spaces of their own.
     pub tiling_spiral: bool,
+    /// The address field in the sidebar; hidden, Ctrl+L brings it back
+    /// while typing and Ctrl+Shift+C copies the page's address.
+    pub show_address: bool,
+    /// How loosely the palette matches what was typed.
+    pub matching: Matching,
 }
 
 impl Default for Settings {
@@ -45,6 +50,34 @@ impl Default for Settings {
             blur: 30.0,
             gpu_frames: false,
             tiling_spiral: false,
+            show_address: true,
+            matching: Matching::default(),
+        }
+    }
+}
+
+/// How loosely the palette matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Matching {
+    /// What was typed, found whole.
+    Exact,
+    /// Also a word one letter off, and letters kept together or starting
+    /// words ("gcal").
+    #[default]
+    Typos,
+    /// Also letters in order anywhere, ranked below the rest.
+    Loose,
+}
+
+impl Matching {
+    pub const ALL: [Self; 3] = [Self::Exact, Self::Typos, Self::Loose];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "Exact",
+            Self::Typos => "Typos",
+            Self::Loose => "Loose",
         }
     }
 }

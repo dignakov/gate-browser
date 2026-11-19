@@ -65,6 +65,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Workspace::on_focus_down))
             .on_action(cx.listener(Workspace::on_dev_tools))
             .on_action(cx.listener(Workspace::on_zoom_pane))
+            .on_action(cx.listener(Workspace::on_put_away_pane))
+            .on_action(cx.listener(Workspace::on_copy_address))
             .on_action(cx.listener(Workspace::on_rename_space))
             .on_action(cx.listener(Workspace::on_open_settings))
             .on_action(cx.listener(Workspace::on_open_palette))
@@ -252,7 +254,10 @@ impl Workspace {
             .child(self.address.clone());
 
         // Spaces takes its share of the lists; Activity the rest.
-        let lists = vh - theme::HEADER_HEIGHT - theme::ADDRESS_BLOCK - theme::FOOTER_HEIGHT;
+        // Hidden in Settings, it shows while focused (Ctrl+L).
+        let show_address = self.store.settings.show_address || self.address_focused;
+        let address_h = if show_address { theme::ADDRESS_BLOCK } else { 0.0 };
+        let lists = vh - theme::HEADER_HEIGHT - address_h - theme::FOOTER_HEIGHT;
         let spaces = div()
             .flex()
             .flex_col()
@@ -329,7 +334,7 @@ impl Workspace {
                     .on_click(cx.listener(|this, _, w, cx| this.on_open_settings(&crate::workspace::OpenSettings, w, cx))),
             );
 
-        div().size_full().flex().flex_col().child(header).child(address).child(spaces).child(activity).child(footer)
+        div().size_full().flex().flex_col().child(header).when(show_address, |d| d.child(address)).child(spaces).child(activity).child(footer)
     }
 
     fn space_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -577,7 +582,8 @@ impl Workspace {
         let items = activity::items(self, cx);
         // Not a page's: the browser's own (a downloaded update).
         let update = self.store.ublock_update.ready.clone();
-        if items.is_empty() && update.is_none() && self.downloads.is_empty() && self.notes.is_empty() {
+        let big_log = self.big_log;
+        if items.is_empty() && update.is_none() && big_log.is_none() && self.downloads.is_empty() && self.notes.is_empty() {
             return vec![
                 div()
                     .px(px(8.))
@@ -595,7 +601,7 @@ impl Workspace {
                 rows.extend(self.notice_rows(cx));
             }
             let group: Vec<_> = items.iter().filter(|i| i.kind == kind).collect();
-            let notices = if kind == Kind::NeedsYou { update.iter().count() } else { 0 };
+            let notices = if kind == Kind::NeedsYou { update.iter().count() + big_log.iter().count() } else { 0 };
             if group.is_empty() && notices == 0 {
                 continue;
             }
@@ -635,6 +641,38 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, w, cx| {
                             this.open_settings(crate::workspace::SettingsSection::AdBlocking, w, cx)
                         }))
+                        .into_any_element(),
+                );
+            }
+            if let (Some(size), Kind::NeedsYou) = (big_log, kind) {
+                rows.push(
+                    div()
+                        .id("activity-big-log")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(px(10.))
+                        .h(px(theme::ROW_HEIGHT))
+                        .px(px(8.))
+                        .rounded(px(theme::CONTROL_RADIUS))
+                        .hover(move |s| s.bg(ink.hover))
+                        .child(div().flex().flex_none().items_center().justify_center().size(px(20.)).child(icon_glyph("icons/circle-alert.svg", 15.0).text_color(theme::needs_you())))
+                        .child(div().flex_1().min_w_0().truncate().child(format!("Log is {} MB", size >> 20)))
+                        .child(
+                            text_button("activity-clear-log", "Clear", false)
+                                .h(px(22.))
+                                .px(px(8.))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.clear_log(cx)
+                                })),
+                        )
+                        // A click shows it in its folder.
+                        .on_click(|_, _, cx| {
+                            if let Some(path) = crate::LOG_PATH.get() {
+                                cx.reveal_path(path);
+                            }
+                        })
                         .into_any_element(),
                 );
             }
@@ -732,6 +770,14 @@ impl Workspace {
             activity.push(
                 rail_item("rail-ublock-update", false, update_tile(20.0).relative().child(status_dot(Kind::NeedsYou)), ink)
                     .on_click(cx.listener(|this, _, w, cx| this.open_settings(crate::workspace::SettingsSection::AdBlocking, w, cx)))
+                    .into_any_element(),
+            );
+        }
+        if self.big_log.is_some() {
+            activity.push(
+                rail_item("rail-big-log", false, div().flex().items_center().justify_center().size(px(20.)).child(icon_glyph("icons/circle-alert.svg", 15.0).text_color(theme::needs_you())), ink)
+                    // Open the sidebar, where its entry can clear it.
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
                     .into_any_element(),
             );
         }
@@ -920,6 +966,13 @@ impl Workspace {
         let (playback, muted) = (v.playback(), v.muted());
         let asks = v.ask().is_some() || v.crashed();
         let zoom = v.zoom_percent();
+        // Linked into other spaces too: which (the same page shows there).
+        let also: Vec<String> = self
+            .spaces_of(pane)
+            .into_iter()
+            .filter(|&t| t != self.active)
+            .map(|t| self.space_name(&self.tabs[t], cx))
+            .collect();
         let header_group: SharedString = format!("pane-header-{pane}").into();
         let button_group = |name: &str| format!("pane-{pane}-{name}");
 
@@ -963,6 +1016,20 @@ impl Workspace {
             .child(site_tile(favicon, &page_url, 14.0))
             .child(div().flex_none().max_w(px(260.)).truncate().font_weight(FontWeight::MEDIUM).child(title))
             .child(div().flex_1().min_w_0().truncate().text_color(theme::text_dim()).child(host))
+            .when(!also.is_empty(), |h| {
+                h.child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .max_w(px(180.))
+                        .items_center()
+                        .gap(px(4.))
+                        .text_size(px(11.))
+                        .text_color(theme::text_dim())
+                        .child(icon_glyph("icons/link.svg", 11.0).text_color(theme::text_dim()))
+                        .child(div().min_w_0().truncate().child(also.join(", "))),
+                )
+            })
             .when(loading, |h| h.child(spinner(("pane-loading", pane), 12.0, theme::working())))
             .when(camera, |h| h.child(icon_glyph("icons/video.svg", 13.0).text_color(theme::live())))
             .when(microphone, |h| h.child(icon_glyph("icons/mic.svg", 13.0).text_color(theme::live())))
@@ -1016,8 +1083,10 @@ impl Workspace {
             self.space_drag.as_ref().filter(|d| d.moved).and_then(|d| d.target).filter(|(t, _)| *t == pane).map(|(_, edge)| Some(edge))
         });
         // Where the split the palette asks about would go.
-        let drop = drop.or_else(|| match self.palette.as_ref().map(|p| p.intent) {
+        let drop = drop.or_else(|| match self.palette.as_ref().map(|p| p.shown()) {
             Some(Intent::Split { target, edge }) if target == pane => Some(Some(edge)),
+            // `!`: the whole pane, as a swap shows.
+            Some(Intent::Here { target }) if target == pane => Some(None),
             _ => None,
         });
 

@@ -147,10 +147,14 @@ impl Workspace {
         self.sidebar.collapsed = s.collapsed;
         self.sidebar.width = s.width.clamp(crate::theme::SIDEBAR_MIN, crate::theme::SIDEBAR_MAX);
         self.sidebar.split = s.split.clamp(0.1, 0.9);
+        // By saved id, across spaces: a page linked into several is one.
+        let mut renamed: HashMap<PaneId, PaneId> = HashMap::new();
         for space in session.spaces {
             let pages: HashMap<PaneId, SavedPage> = space.pages.into_iter().map(|p| (p.id, p)).collect();
-            let mut renamed: HashMap<PaneId, PaneId> = HashMap::new();
             let root = space.root.map_panes(&mut |old| {
+                if let Some(&id) = renamed.get(&old) {
+                    return Some(id);
+                }
                 let page = pages.get(&old)?;
                 let favicon = self.cached_favicon(url::host(&page.url));
                 let view = cx.new(|cx| WebView::sleeping(&page.url, &page.title, favicon, window, cx));

@@ -153,31 +153,40 @@ fn main() {
     });
 }
 
-/// Logs to stderr, and on Windows (where Gate has no console) to `gate.log`
-/// in the profile, appended to, each run starting with a header line. Panics
-/// are logged too. `GATE_LOG` filters (e.g. `GATE_LOG=debug`).
+/// Where the log is written (see [`start_logging`]).
+pub static LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// While Gate is in development: debug logging, to `gate.log` in the
+/// profile, appended to, each run starting with a header line; Activity
+/// says when it gets big (see `Workspace::check_log`). Not on Windows
+/// (no console), also to stderr, less of it. Panics are logged too.
+/// `GATE_LOG` filters both (e.g. `GATE_LOG=info`).
 fn start_logging(profile: &std::path::Path) {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("GATE_LOG").unwrap_or_else(|_| "warn,gate=info,web=info".into());
-    let level = filter.to_string();
-    #[cfg(windows)]
-    let file = {
-        let _ = std::fs::create_dir_all(profile);
-        let path = profile.join("gate.log");
-        // A long-lived log starts over rather than grow without end.
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) {
-            let _ = std::fs::remove_file(&path);
-        }
-        std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
-    };
-    #[cfg(not(windows))]
-    let file: Option<std::fs::File> = {
-        let _ = profile;
-        None
-    };
-    match file {
-        Some(file) => tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(std::sync::Mutex::new(file)).init(),
-        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
+    let chosen = std::env::var("GATE_LOG").ok().filter(|f| !f.is_empty());
+    let file_filter = chosen.clone().unwrap_or_else(|| "warn,gate=debug,web=debug,layout=debug".into());
+    let level = file_filter.clone();
+    let _ = std::fs::create_dir_all(profile);
+    let path = profile.join("gate.log");
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+    if file.is_some() {
+        let _ = LOG_PATH.set(path);
     }
+    let mut layers: Vec<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>> = Vec::new();
+    if let Some(file) = file {
+        layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_filter(EnvFilter::new(&file_filter))
+                .boxed(),
+        );
+    }
+    if cfg!(not(windows)) {
+        let filter = chosen.unwrap_or_else(|| "warn,gate=info,web=info".into());
+        layers.push(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(EnvFilter::new(filter)).boxed());
+    }
+    tracing_subscriber::registry().with(layers).init();
     tracing::info!(
         "Gate {} ({} {}), pid {}, engine {}, log {level}",
         env!("CARGO_PKG_VERSION"),

@@ -445,6 +445,18 @@ impl Workspace {
         if matches!(settings.background, Background::Wallpaper { .. }) {
             page = page.child(row("Blur", Some("How frosted the sidebar's glass is.".to_string()), false, self.slider(Slider::Blur, cx)));
         }
+        let shown = settings.show_address;
+        page = page.child(row(
+            "Address bar",
+            Some("Hidden, Ctrl+L shows it while you type; Ctrl+Shift+C copies the page's address.".to_string()),
+            false,
+            toggle("settings-show-address", shown, true)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.store.set(|s| s.show_address = !s.show_address);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        ));
         let floating = settings.floating_sidebar;
         page = page.child(row(
             "Floating sidebar",
@@ -501,7 +513,7 @@ impl Workspace {
 }
 
 /// A row of choices, one of them on (`on`); `pick` gets the one clicked.
-fn segments(
+pub(crate) fn segments(
     id: &str,
     labels: &[&'static str],
     on: usize,

@@ -54,6 +54,7 @@ impl Workspace {
         let page = match section {
             SettingsSection::Look => self.look_page(cx),
             SettingsSection::Tiling => self.tiling_page(cx),
+            SettingsSection::Search => self.search_page(cx),
             SettingsSection::AdBlocking => self.ad_blocking_page(cx),
         };
 
@@ -130,6 +131,32 @@ impl Workspace {
                 Some("Hold Shift while dragging a pane by its header to swap it with the one it's dropped on.".to_string()),
                 false,
                 div().into_any_element(),
+            ))
+            .into_any_element()
+    }
+
+    fn search_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::settings::Matching;
+        let on = Matching::ALL.iter().position(|m| *m == self.store.settings.matching).unwrap_or(1);
+        let labels = Matching::ALL.map(Matching::label);
+        let choice = crate::look::segments("matching", &labels, on, cx, |this, i, _, cx| {
+            this.store.set(|s| s.matching = Matching::ALL[i]);
+            cx.notify();
+        });
+        div()
+            .flex()
+            .flex_col()
+            .child(heading("Search"))
+            .child(row(
+                "Matching",
+                Some(
+                    "How the palette matches what you type to open pages and commands. Exact: as typed. Typos: also a \
+                     word one letter off (4+ letters), and letters kept together or starting words (\"gcal\" for Google \
+                     Calendar). Loose: also letters in order anywhere, ranked below everything else."
+                        .to_string(),
+                ),
+                false,
+                choice,
             ))
             .into_any_element()
     }

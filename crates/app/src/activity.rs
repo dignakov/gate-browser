@@ -45,8 +45,13 @@ pub struct Item {
 /// urgent reason.
 pub fn items(workspace: &Workspace, cx: &App) -> Vec<Item> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for tab in &workspace.tabs {
         for pane in tab.root.panes() {
+            // A page linked into several spaces is listed once.
+            if !seen.insert(pane) {
+                continue;
+            }
             let Some(p) = workspace.panes.get(&pane) else { continue };
             let view = p.view.read(cx);
             let (camera, microphone) = view.media();

@@ -52,7 +52,16 @@ impl Workspace {
             Some(item) => item.download = download.clone(),
             None => self.downloads.insert(0, DownloadItem { pane, download: download.clone() }),
         }
+        // A page kept open only for its downloads closes once they end.
+        if !self.downloading(pane) {
+            self.release(pane, cx);
+        }
         cx.notify();
+    }
+
+    /// Whether a page has downloads under way.
+    pub fn downloading(&self, pane: PaneId) -> bool {
+        self.downloads.iter().any(|d| d.pane == pane && d.download.state == DownloadState::Running)
     }
 
     /// Opens a finished download.

@@ -10,6 +10,7 @@ use crate::chrome::icon_glyph;
 use crate::render::{page_title, site_tile};
 use crate::text_input::{InputEvent, TextInput};
 use crate::workspace::{self as ws, Workspace};
+use crate::settings::Matching;
 use crate::{theme, url};
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, Focusable as _, FontWeight, InteractiveElement as _, IntoElement, MouseButton,
@@ -28,9 +29,12 @@ pub enum Intent {
     Anything,
     /// A new space: opens what is chosen in one (or goes to it if open).
     NewSpace,
-    /// A new pane beside `target`: opens what is chosen there, or moves an
-    /// open page there.
+    /// A new pane beside `target`: opens what is chosen there, or shows an
+    /// open page there too (linked: it stays in its own space).
     Split { target: PaneId, edge: Edge },
+    /// `!` typed first: what is chosen takes `target`'s place, and what was
+    /// there goes to a space of its own (as dragged to the sidebar).
+    Here { target: PaneId },
 }
 
 impl Intent {
@@ -40,13 +44,16 @@ impl Intent {
             Self::NewSpace => Some("New space"),
             Self::Split { edge: Edge::Bottom | Edge::Top, .. } => Some("Split down"),
             Self::Split { .. } => Some("Split right"),
+            Self::Here { .. } => Some("Put here"),
         }
     }
 
     fn placeholder(self) -> &'static str {
         match self {
-            Self::Anything => "Search open pages, the web, or commands  (? web, ?? history)",
-            Self::NewSpace | Self::Split { .. } => "Search open pages or the web, or enter an address  (? web, ?? history)",
+            Self::Anything => "Search open pages, the web, or commands  (? web, ?? history, ! here)",
+            Self::NewSpace | Self::Split { .. } | Self::Here { .. } => {
+                "Search open pages or the web, or enter an address  (? web, ?? history)"
+            }
         }
     }
 }
@@ -55,6 +62,8 @@ impl Intent {
 pub enum Choice {
     /// A page that is already open.
     Pane(PaneId),
+    /// A linked page in one of its spaces (→ on its row lists them).
+    InSpace(PaneId, ws::TabId),
     /// A page from history (not open now).
     History { url: String, title: String, icon: Option<Arc<RenderImage>> },
     /// An address to load.
@@ -64,9 +73,22 @@ pub enum Choice {
     Command(usize),
 }
 
+impl Palette {
+    /// What the palette does now: what it was opened for, unless `!` asks
+    /// for the focused pane.
+    pub fn shown(&self) -> Intent {
+        self.here.map_or(self.intent, |target| Intent::Here { target })
+    }
+}
+
 pub struct Palette {
     pub input: Entity<TextInput>,
     pub intent: Intent,
+    /// The focused pane, while the query starts with `!`.
+    pub here: Option<PaneId>,
+    /// What each open page's site calls itself, by host (see
+    /// [`crate::db::Db::site_names`]), read as the palette opens.
+    pub sites: std::collections::HashMap<String, Vec<String>>,
     pub choices: Vec<Choice>,
     pub selected: usize,
     pub scroll: ScrollHandle,
@@ -89,11 +111,13 @@ const COMMANDS: &[Command] = &[
     Command { title: "Split right", keywords: "pane vertical beside", key: Some("Ctrl+\\"), needs_page: true, run: |w, win, cx| w.on_split_right(&ws::SplitRight, win, cx) },
     Command { title: "Split down", keywords: "pane horizontal below", key: Some("Ctrl+Shift+\\"), needs_page: true, run: |w, win, cx| w.on_split_down(&ws::SplitDown, win, cx) },
     Command { title: "Zoom pane", keywords: "maximize fill", key: Some("Ctrl+Shift+Enter"), needs_page: true, run: |w, win, cx| w.on_zoom_pane(&ws::ZoomPane, win, cx) },
+    Command { title: "Move pane to its own space", keywords: "shelve put away sidebar new space detach", key: Some("Ctrl+Alt+S"), needs_page: true, run: |w, win, cx| w.on_put_away_pane(&ws::PutAwayPane, win, cx) },
+    Command { title: "Copy page address", keywords: "url link clipboard", key: Some("Ctrl+Shift+C"), needs_page: true, run: |w, win, cx| w.on_copy_address(&ws::CopyAddress, win, cx) },
     Command { title: "Close pane", keywords: "page kill", key: Some("Ctrl+W"), needs_page: true, run: |w, win, cx| w.on_close_pane(&ws::ClosePane, win, cx) },
     Command { title: "Close space", keywords: "tab kill", key: Some("Ctrl+Shift+W"), needs_page: true, run: |w, win, cx| w.on_close_tab(&ws::CloseTab, win, cx) },
     Command { title: "Rename space", keywords: "tab name", key: Some("F2"), needs_page: true, run: |w, win, cx| w.on_rename_space(&ws::RenameSpace, win, cx) },
-    Command { title: "Next space", keywords: "tab", key: Some("Ctrl+Tab"), needs_page: true, run: |w, win, cx| w.on_next_tab(&ws::NextTab, win, cx) },
-    Command { title: "Previous space", keywords: "tab", key: Some("Ctrl+Shift+Tab"), needs_page: true, run: |w, win, cx| w.on_prev_tab(&ws::PrevTab, win, cx) },
+    Command { title: "Next space", keywords: "tab", key: Some("Ctrl+PageDown"), needs_page: true, run: |w, win, cx| w.on_next_tab(&ws::NextTab, win, cx) },
+    Command { title: "Previous space", keywords: "tab", key: Some("Ctrl+PageUp"), needs_page: true, run: |w, win, cx| w.on_prev_tab(&ws::PrevTab, win, cx) },
     Command { title: "Reload page", keywords: "refresh", key: Some("Ctrl+R"), needs_page: true, run: |w, win, cx| w.on_reload(&ws::Reload, win, cx) },
     Command { title: "Back", keywords: "history previous page", key: Some("Alt+Left"), needs_page: true, run: |w, win, cx| w.on_back(&ws::Back, win, cx) },
     Command { title: "Forward", keywords: "history next page", key: Some("Alt+Right"), needs_page: true, run: |w, win, cx| w.on_forward(&ws::Forward, win, cx) },
@@ -115,21 +139,31 @@ const WIDTH: f32 = 620.0;
 
 /// How well `query` (words, any order, each matched) fits `text`, if at
 /// all: a word found whole beats letters in order; at a word's start, more.
-pub fn score(query: &str, text: &str) -> Option<i32> {
+pub fn score(query: &str, text: &str, matching: Matching) -> Option<i32> {
     let text = text.to_lowercase();
     let mut total = 0;
     for word in query.to_lowercase().split_whitespace() {
-        total += word_score(word, &text)?;
+        total += word_score(word, &text, matching)?;
     }
     Some(total)
 }
 
-fn word_score(word: &str, text: &str) -> Option<i32> {
+fn word_score(word: &str, text: &str, matching: Matching) -> Option<i32> {
     if let Some(at) = text.find(word) {
         let starts_word = text[..at].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
         return Some(1000 - at.min(200) as i32 + if starts_word { 500 } else { 0 });
     }
-    // Its letters in order, fewer skipped letters ranking higher.
+    match matching {
+        Matching::Exact => return None,
+        // Letters in order anywhere, below everything else.
+        Matching::Loose => return near_score(word, text).or_else(|| scattered(word, text)),
+        Matching::Typos => {}
+    }
+    near_score(word, text)
+}
+
+/// The old loose match: `word`'s letters in order anywhere in `text`.
+fn scattered(word: &str, text: &str) -> Option<i32> {
     let mut rest = text.chars();
     let mut skipped = 0;
     for c in word.chars() {
@@ -141,7 +175,88 @@ fn word_score(word: &str, text: &str) -> Option<i32> {
             }
         }
     }
-    Some(300 - skipped.min(250))
+    Some(150 - skipped.min(140))
+}
+
+/// Not found whole: a word one letter off, or the letters kept together.
+fn near_score(word: &str, text: &str) -> Option<i32> {
+    // A word with one letter off (swapped, missing, extra or wrong):
+    // typed before coffee.
+    let typo = typo_score(word, text);
+    // Its letters in order, close together or starting words ("gcal":
+    // Google Calendar), fewer skipped letters ranking higher. Letters
+    // strewn across a long title ("gmail" in "GitHub - moq: Media over
+    // QUIC: Real-time…") are no match.
+    typo.max(in_order(word, text))
+}
+
+/// `word`'s letters in order in `text`, kept together (see [`word_score`]).
+fn in_order(word: &str, text: &str) -> Option<i32> {
+    let text: Vec<char> = text.chars().collect();
+    let starts = |i: usize| i == 0 || !text[i - 1].is_alphanumeric();
+    let mut at = 0;
+    let mut skipped = 0;
+    for (n, c) in word.chars().enumerate() {
+        // The very next letter, else one starting a word, else any.
+        let found = if text.get(at) == Some(&c) {
+            at
+        } else {
+            (at..text.len())
+                .find(|&i| text[i] == c && starts(i))
+                .or_else(|| (at..text.len()).find(|&i| text[i] == c))?
+        };
+        // The first letter starts a word; later ones follow on, or start
+        // a word of their own (what was passed over doesn't count).
+        if n == 0 && !starts(found) {
+            return None;
+        }
+        if n > 0 && !starts(found) {
+            skipped += found - at;
+        }
+        at = found + 1;
+    }
+    let letters = word.chars().count();
+    (skipped <= letters.max(2)).then(|| 300 - skipped as i32 * 20)
+}
+
+/// A word of `text` (or its start) one letter off `word`: 4 letters or
+/// more, so short ones don't match everything.
+fn typo_score(word: &str, text: &str) -> Option<i32> {
+    let w: Vec<char> = word.chars().collect();
+    if w.len() < 4 {
+        return None;
+    }
+    text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()).find_map(|t| {
+        let t: Vec<char> = t.chars().collect();
+        // The word whole, or as far as was typed (one letter either way).
+        (w.len() - 1..=w.len() + 1).filter(|&n| n <= t.len()).any(|n| one_off(&w, &t[..n])).then_some(400)
+    })
+}
+
+/// Whether `a` and `b` are one edit apart, two neighbors swapped counting
+/// as one (optimal string alignment distance 1).
+fn one_off(a: &[char], b: &[char]) -> bool {
+    let (n, m) = (a.len(), b.len());
+    if n.abs_diff(m) > 1 {
+        return false;
+    }
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for i in 0..=n {
+        d[i][0] = i;
+    }
+    for j in 0..=m {
+        d[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[n][m] <= 1
 }
 
 impl Workspace {
@@ -155,7 +270,15 @@ impl Workspace {
             InputEvent::Focused | InputEvent::Blurred => {}
         });
         window.focus(&input.read(cx).focus_handle(cx), cx);
-        self.palette = Some(Palette { input, intent, choices: Vec::new(), selected: 0, scroll: ScrollHandle::new(), _events: events });
+        let mut sites = std::collections::HashMap::new();
+        for p in self.panes.values() {
+            let host = url::host(p.view.read(cx).url()).to_string();
+            if !host.is_empty() && !sites.contains_key(&host) {
+                let names = self.db.site_names(&host);
+                sites.insert(host, names);
+            }
+        }
+        self.palette = Some(Palette { input, intent, here: None, sites, choices: Vec::new(), selected: 0, scroll: ScrollHandle::new(), _events: events });
         self.refresh_palette(cx);
     }
 
@@ -184,7 +307,7 @@ impl Workspace {
         }
         // Stops at the ends, as herdr's does.
         p.selected = (p.selected as isize + delta).clamp(0, p.choices.len() as isize - 1) as usize;
-        let row = row_index(&p.choices, p.selected, p.intent);
+        let row = row_index(&p.choices, p.selected, p.shown());
         p.scroll.scroll_to_item(row);
         cx.notify();
     }
@@ -193,6 +316,12 @@ impl Workspace {
         let Some((query, intent)) = self.palette.as_ref().map(|p| (p.input.read(cx).text().trim().to_string(), p.intent)) else {
             return;
         };
+        // `!` first: for the focused pane; the rest reads as usual.
+        let (query, here) = match query.strip_prefix('!') {
+            Some(rest) => (rest.trim_start().to_string(), self.active_tab().map(|t| t.focused)),
+            None => (query, None),
+        };
+        let intent = here.map_or(intent, |target| Intent::Here { target });
         let choices = if let Some(words) = query.strip_prefix("??") {
             self.history_only(words.trim())
         } else if let Some(words) = query.strip_prefix('?') {
@@ -203,6 +332,7 @@ impl Workspace {
             self.palette_choices(&query, intent, history, cx)
         };
         if let Some(p) = self.palette.as_mut() {
+            p.here = here;
             p.choices = choices;
             p.selected = 0;
             p.scroll.scroll_to_item(0);
@@ -244,42 +374,76 @@ impl Workspace {
     }
 
     fn palette_choices(&self, query: &str, intent: Intent, history: Vec<Choice>, cx: &App) -> Vec<Choice> {
-        // A split can bring over a page from another space, not its own.
+        // A split can bring over a page from another space, not one
+        // already beside it.
         let skip_tab = match intent {
             Intent::Split { target, .. } => self.tab_of(target),
             _ => None,
         };
-        let mut pages: Vec<(i32, usize, PaneId)> = Vec::new();
-        for (t, tab) in self.tabs.iter().enumerate() {
-            if Some(t) == skip_tab {
-                continue;
-            }
+        // Each page once, linked or not, placed by the space it goes to.
+        // (match, extra from `nudge`, space, page)
+        let mut pages: Vec<(i32, i32, usize, PaneId)> = Vec::new();
+        let mut seen = HashSet::new();
+        for tab in &self.tabs {
             for pane in tab.root.panes() {
+                if !seen.insert(pane) || intent == (Intent::Here { target: pane }) {
+                    continue;
+                }
+                if skip_tab.is_some_and(|t| self.tabs[t].root.contains(pane)) {
+                    continue;
+                }
                 let Some(view) = self.panes.get(&pane).map(|p| p.view.read(cx)) else { continue };
                 if url::display(view.url()).is_empty() {
                     continue;
                 }
+                let spaces = self.spaces_of(pane);
                 let fit = if query.is_empty() {
-                    Some(0)
+                    Some((0, 0))
                 } else {
-                    [
-                        score(query, &page_title(view)),
-                        score(query, url::host(view.url())).map(|s| s + 100),
-                        score(query, view.url()).map(|s| s - 100),
-                        tab.name.as_deref().and_then(|n| score(query, n)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .max()
+                    let m = self.store.settings.matching;
+                    let names = self.palette.as_ref().and_then(|p| p.sites.get(url::host(view.url())));
+                    // What it's called: its title, or its site's own name
+                    // ("gmail": a Workspace inbox titled by account).
+                    let named = std::iter::once(score(query, &page_title(view), m))
+                        .chain(names.into_iter().flatten().map(|n| score(query, n, m)))
+                        .flatten()
+                        .max();
+                    // Where it is.
+                    let address = [score(query, url::host(view.url()), m).map(|s| s + 100), score(query, view.url(), m).map(|s| s - 100)]
+                        .into_iter()
+                        .flatten()
+                        .max();
+                    let space = spaces.iter().filter_map(|&t| self.tabs[t].name.as_deref().and_then(|n| score(query, n, m))).max();
+                    // The best counts whole; each other that matches adds
+                    // a quarter (a title and an address beat a title alone).
+                    let mut fits: Vec<i32> = [named, address, space].into_iter().flatten().collect();
+                    fits.sort_unstable_by(|a, b| b.cmp(a));
+                    let fit = fits.first().map(|best| best + fits[1..].iter().map(|f| f / 4).sum::<i32>());
+                    let solo = spaces.iter().any(|&t| self.is_solo(t));
+                    let visited = spaces.iter().map(|&t| self.visit_order(t)).min().unwrap_or(usize::MAX);
+                    fit.map(|fit| (fit, nudge(space.is_some(), solo, visited)))
                 };
-                if let Some(fit) = fit {
-                    pages.push((fit, t, pane));
+                if let (Some((fit, extra)), Some(t)) = (fit, self.home_of(pane)) {
+                    pages.push((fit, extra, t, pane));
                 }
             }
         }
         // Best first; ties keep the sidebar's order.
-        pages.sort_by_key(|(fit, t, _)| (-fit, *t));
-        let pages = pages.into_iter().map(|(_, _, pane)| Choice::Pane(pane));
+        pages.sort_by_key(|(fit, extra, t, _)| (-(fit + extra), *t));
+        // How open pages ranked (never what was typed), for a ranking
+        // that surprises.
+        if !query.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+            let top: Vec<String> = pages
+                .iter()
+                .take(5)
+                .filter_map(|(fit, extra, t, pane)| {
+                    let view = self.panes.get(pane)?.view.read(cx);
+                    Some(format!("{fit}+{extra} {:?} ({}) in space {t}", page_title(view), url::host(view.url())))
+                })
+                .collect();
+            tracing::debug!("palette: open pages ranked: {}", top.join("; "));
+        }
+        let pages = pages.into_iter().map(|(_, _, _, pane)| Choice::Pane(pane));
 
         let go = (!query.is_empty()).then(|| {
             if url::is_address(query) { Choice::Open(url::resolve(query)) } else { Choice::Search(query.to_string()) }
@@ -291,7 +455,7 @@ impl Workspace {
                 if c.needs_page && self.tabs.is_empty() {
                     continue;
                 }
-                let fit = if query.is_empty() { Some(0) } else { score(query, &format!("{} {}", c.title, c.keywords)) };
+                let fit = if query.is_empty() { Some(0) } else { score(query, &format!("{} {}", c.title, c.keywords), self.store.settings.matching) };
                 if let Some(fit) = fit {
                     commands.push((fit, i));
                 }
@@ -316,7 +480,23 @@ impl Workspace {
         // straight there comes first.
         let mut out: Vec<Choice> = named.collect();
         let pages: Vec<_> = pages.collect();
-        if (pages.is_empty() && history.is_empty()) || query.is_empty() {
+        // An address typed means that address: pages open at it first, then
+        // going there, then history under it; whatever only mentions it
+        // (its GitHub, a page about it) after.
+        if url::is_address(query) {
+            let at = |c: &Choice| match c {
+                Choice::Pane(pane) => self.panes.get(pane).is_some_and(|p| url::is_under(p.view.read(cx).url(), query)),
+                Choice::History { url: u, .. } => url::is_under(u, query),
+                _ => false,
+            };
+            let (open_at, pages): (Vec<_>, Vec<_>) = pages.into_iter().partition(|c| at(c));
+            let (history_at, history): (Vec<_>, Vec<_>) = history.into_iter().partition(|c| at(c));
+            out.extend(open_at);
+            out.extend(go);
+            out.extend(history_at);
+            out.extend(pages);
+            out.extend(history);
+        } else if (pages.is_empty() && history.is_empty()) || query.is_empty() {
             out.extend(go);
             out.extend(pages);
         } else {
@@ -332,13 +512,23 @@ impl Workspace {
     pub fn run_choice(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(p) = self.palette.as_ref() else { return };
         let Some(choice) = p.choices.get(index.unwrap_or(p.selected)).cloned() else { return };
-        let intent = p.intent;
+        let intent = p.shown();
         self.palette = None;
         match choice {
             Choice::Pane(pane) => match intent {
-                Intent::Split { target, edge } => self.move_beside(pane, target, edge, window, cx),
+                Intent::Split { target, edge } => self.link_beside(pane, target, edge, window, cx),
+                Intent::Here { target } => {
+                    self.link_beside(pane, target, Edge::Right, window, cx);
+                    self.put_away(target, window, cx);
+                }
                 _ => self.reveal_pane(pane, window, cx),
             },
+            Choice::InSpace(pane, tab) => {
+                if let Some(index) = self.tabs.iter().position(|t| t.id == tab && t.root.contains(pane)) {
+                    self.tabs[index].focused = pane;
+                    self.activate(index, window, cx);
+                }
+            }
             Choice::Open(address) | Choice::History { url: address, .. } => self.open_for(intent, &address, window, cx),
             Choice::Search(words) => self.open_for(intent, &url::search(&words), window, cx),
             Choice::Command(i) => {
@@ -361,6 +551,10 @@ impl Workspace {
     fn open_for(&mut self, intent: Intent, address: &str, window: &mut Window, cx: &mut Context<Self>) {
         match intent {
             Intent::Split { target, edge } => self.split_with(target, edge, address, window, cx),
+            Intent::Here { target } => {
+                self.split_with(target, Edge::Right, address, window, cx);
+                self.put_away(target, window, cx);
+            }
             Intent::Anything | Intent::NewSpace => self.open_tab(address, true, window, cx),
         }
     }
@@ -376,7 +570,7 @@ impl Workspace {
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut group = None;
         for (i, choice) in p.choices.iter().enumerate() {
-            let head = group_of(choice, p.intent);
+            let head = group_of(choice, p.shown());
             if group != Some(head) {
                 group = Some(head);
                 rows.push(
@@ -394,7 +588,7 @@ impl Workspace {
                         .into_any_element(),
                 );
             }
-            rows.push(self.palette_row(i, choice, i == p.selected, p.intent, cx).into_any_element());
+            rows.push(self.palette_row(i, choice, i == p.selected, p.shown(), cx).into_any_element());
         }
         let heads = rows.len() - p.choices.len();
         let list_h = (p.choices.len() as f32 * ROW_H + heads as f32 * HEAD_H).min(SHOWN * ROW_H + 2.0 * HEAD_H);
@@ -411,7 +605,7 @@ impl Workspace {
             .border_color(theme::accent())
             .bg(theme::canvas())
             .child(icon_glyph("icons/search.svg", 15.0).text_color(theme::text_dim()))
-            .when_some(p.intent.label(), |f, label| {
+            .when_some(p.shown().label(), |f, label| {
                 f.child(
                     div()
                         .flex_none()
@@ -448,6 +642,8 @@ impl Workspace {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_action(cx.listener(|this, _: &ws::PaletteUp, _, cx| this.move_palette_selection(-1, cx)))
             .on_action(cx.listener(|this, _: &ws::PaletteDown, _, cx| this.move_palette_selection(1, cx)))
+            // → at the end of what was typed: a linked page's spaces.
+            .on_action(cx.listener(|this, _: &crate::text_input::Right, _, cx| this.expand_spaces(cx)))
             .child(field)
             .when(!rows.is_empty(), |c| {
                 c.child(
@@ -480,8 +676,10 @@ impl Workspace {
 /// The group title a row shows under.
 fn group_of(choice: &Choice, intent: Intent) -> &'static str {
     match (choice, intent) {
-        (Choice::Pane(_), Intent::Split { .. }) => "Move here",
+        (Choice::Pane(_), Intent::Split { .. }) => "Show here",
+        (Choice::Pane(_), Intent::Here { .. }) => "Put here",
         (Choice::Pane(_), _) => "Open",
+        (Choice::InSpace(..), _) => "Spaces",
         (Choice::History { .. }, _) => "History",
         (Choice::Open(_) | Choice::Search(_), _) => "Go",
         (Choice::Command(_), _) => "Commands",
@@ -504,20 +702,107 @@ fn row_index(choices: &[Choice], choice: usize, intent: Intent) -> usize {
 }
 
 impl Workspace {
+    /// → on a linked page's row: a row for each of its spaces instead, the
+    /// one Enter would have gone to first.
+    fn expand_spaces(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.palette.as_ref() else { return };
+        let (Some(Choice::Pane(pane)), Intent::Anything | Intent::NewSpace) = (p.choices.get(p.selected), p.shown()) else { return };
+        let pane = *pane;
+        let mut spaces = self.spaces_of(pane);
+        if spaces.len() < 2 {
+            return;
+        }
+        let first = self.home_of(pane);
+        spaces.sort_by_key(|&t| Some(t) != first);
+        let choices = spaces.into_iter().map(|t| Choice::InSpace(pane, self.tabs[t].id)).collect();
+        let Some(p) = self.palette.as_mut() else { return };
+        p.choices = choices;
+        p.selected = 0;
+        p.scroll.scroll_to_item(0);
+        cx.notify();
+    }
+
+    /// Where an open page is, under its title: its site, and its space
+    /// when that says more (named, split, or linked: each space).
+    fn where_shown(&self, pane: PaneId, cx: &App) -> String {
+        let host = url::host(self.panes[&pane].view.read(cx).url()).to_string();
+        let first = self.home_of(pane);
+        let mut spaces = self.spaces_of(pane);
+        spaces.sort_by_key(|&t| Some(t) != first);
+        let Some(&home) = spaces.first() else { return host };
+        let tab = &self.tabs[home];
+        if spaces.len() == 1 && tab.name.is_none() && tab.root.panes().len() == 1 {
+            return host;
+        }
+        let mut text = format!("{host} · {}", self.layout_label(home, cx));
+        if spaces.len() > 1 {
+            let others: Vec<String> = spaces[1..].iter().map(|&t| self.space_name(&self.tabs[t], cx)).collect();
+            text.push_str(&format!(", also {}", others.join(", ")));
+        }
+        text
+    }
+
+    /// A space as named, with its split pages when it has several.
+    fn layout_label(&self, index: usize, cx: &App) -> String {
+        let tab = &self.tabs[index];
+        match &tab.name {
+            Some(name) if tab.root.panes().len() > 1 => format!("{name}: {}", self.layout_text(&tab.root, cx)),
+            Some(name) => name.clone(),
+            None if tab.root.panes().len() > 1 => self.layout_text(&tab.root, cx),
+            None => self.space_name(tab, cx),
+        }
+    }
+
+    /// A split as text: side by side `a | b`, stacked `a / b`.
+    fn layout_text(&self, node: &layout::Node, cx: &App) -> String {
+        match node {
+            layout::Node::Pane { pane } => {
+                let Some(p) = self.panes.get(pane) else { return String::new() };
+                let title = page_title(p.view.read(cx));
+                match title.char_indices().nth(18) {
+                    Some((at, _)) => format!("{}…", title[..at].trim_end()),
+                    None => title,
+                }
+            }
+            layout::Node::Split { axis, children } => {
+                let sep = if *axis == layout::Axis::Row { " | " } else { " / " };
+                let parts: Vec<String> = children
+                    .iter()
+                    .map(|c| match c.node {
+                        layout::Node::Split { .. } => format!("({})", self.layout_text(&c.node, cx)),
+                        _ => self.layout_text(&c.node, cx),
+                    })
+                    .collect();
+                parts.join(sep)
+            }
+        }
+    }
 
     fn palette_row(&self, i: usize, choice: &Choice, on: bool, intent: Intent, cx: &mut Context<Self>) -> impl IntoElement {
         let (tile, title, detail, hint): (AnyElement, String, Option<String>, Option<AnyElement>) = match choice {
             Choice::Pane(pane) => {
                 let view = self.panes[pane].view.read(cx);
                 let hint = match intent {
-                    Intent::Split { .. } => "Move here",
+                    Intent::Split { .. } => "Show here",
+                    Intent::Here { .. } => "Put here",
+                    _ if self.spaces_of(*pane).len() > 1 => "Switch to  → spaces",
                     _ => "Switch to",
                 };
                 (
                     site_tile(view.favicon(), view.url(), 18.0).into_any_element(),
                     page_title(view),
-                    Some(url::host(view.url()).to_string()),
+                    Some(self.where_shown(*pane, cx)),
                     Some(div().text_size(px(11.5)).text_color(theme::text_dim()).child(hint).into_any_element()),
+                )
+            }
+            Choice::InSpace(pane, tab) => {
+                let Some(tab) = self.tabs.iter().find(|t| t.id == *tab) else { return div().id(SharedString::from(format!("palette-row-{i}"))) };
+                let view = self.panes[pane].view.read(cx);
+                (
+                    site_tile(view.favicon(), view.url(), 18.0).into_any_element(),
+                    self.space_name(tab, cx),
+                    Some(self.layout_text(&tab.root, cx)),
+                    Some(div().text_size(px(11.5)).text_color(theme::text_dim()).child("Go to").into_any_element()),
                 )
             }
             Choice::History { url: address, title, icon } => (
@@ -593,4 +878,53 @@ fn keys(combo: &'static str) -> impl IntoElement {
             .text_color(theme::text_dim())
             .child(p)
     }))
+}
+
+
+/// Small extras that only decide between pages matching about as well
+/// (a typo scores 400, a whole word 1000 and up): a space named for what
+/// was typed, then a page alone in a space (Gmail itself, not the Gmail
+/// in a split), then the spaces visited last (0: the current one).
+fn nudge(named_space: bool, solo: bool, visited: usize) -> i32 {
+    let recent = 15 - 3 * visited.min(5) as i32;
+    (if named_space { 40 } else { 0 }) + (if solo { 20 } else { 0 }) + recent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nudge, score};
+    use crate::settings::Matching;
+
+    #[test]
+    fn nudges() {
+        // Alone beats in a split, even visited longer ago.
+        assert!(nudge(false, true, usize::MAX) > nudge(false, false, 0));
+        // A space named for it beats both.
+        assert!(nudge(true, false, usize::MAX) > nudge(false, true, 0));
+        // Otherwise the more recent first.
+        assert!(nudge(false, true, 1) > nudge(false, true, 3));
+        // Never enough to lift a typo over a whole word.
+        assert!(400 + nudge(true, true, 0) < 1000);
+    }
+
+    #[test]
+    fn whole_words_beat_scattered_letters() {
+        assert!(score("gmail", "Inbox (3) - someone@gmail.com - Gmail", Matching::Typos).unwrap() > 1000);
+        // Letters strewn across a long title are no match.
+        assert_eq!(score("gmail", "GitHub - moq-dev/moq: Media over QUIC: Real-time", Matching::Typos), None);
+        assert_eq!(score("gmail", "curobo/AGENTS.md at main · NVlabs/curobo · GitHub", Matching::Typos), None);
+        // Initials and near-runs still match.
+        assert!(score("gcal", "Google Calendar", Matching::Typos).is_some());
+        assert!(score("ghub", "github.com", Matching::Typos).is_some());
+        assert!(score("yt", "YouTube", Matching::Typos).is_some());
+        // One letter off, for words of four letters or more.
+        for typo in ["gmial", "gmal", "gnail", "gmaill"] {
+            assert!(score(typo, "Inbox (3) - Gmail", Matching::Typos).is_some(), "{typo}");
+        }
+        assert_eq!(score("gmial", "GitHub - moq-dev/moq: Media over QUIC", Matching::Typos), None);
+        assert_eq!(score("yuo", "YouTube", Matching::Typos), None);
+        // Exact takes it whole; Loose takes letters anywhere, ranked low.
+        assert_eq!(score("gmial", "Gmail", Matching::Exact), None);
+        assert!(score("gmail", "GitHub - moq-dev/moq: Media over QUIC: Real-time", Matching::Loose).unwrap() < 300);
+    }
 }

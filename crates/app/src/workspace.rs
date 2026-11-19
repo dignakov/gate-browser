@@ -20,6 +20,8 @@ actions!(
     [
         NewTab,
         NewTile,
+        PutAwayPane,
+        CopyAddress,
         RecentSpace,
         RecentSpaceBack,
         ClosePane,
@@ -57,6 +59,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w", ClosePane, ctx),
         KeyBinding::new("ctrl-shift-w", CloseTab, ctx),
         KeyBinding::new("ctrl-l", FocusAddress, ctx),
+        KeyBinding::new("ctrl-shift-c", CopyAddress, ctx),
         KeyBinding::new("ctrl-r", Reload, ctx),
         KeyBinding::new("f5", Reload, ctx),
         KeyBinding::new("alt-left", Back, ctx),
@@ -64,6 +67,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-\\", SplitRight, ctx),
         KeyBinding::new("ctrl-shift-\\", SplitDown, ctx),
         KeyBinding::new("ctrl-alt-enter", NewTile, ctx),
+        KeyBinding::new("ctrl-alt-s", PutAwayPane, ctx),
         KeyBinding::new("ctrl-b", ToggleSidebar, ctx),
         KeyBinding::new("ctrl-tab", RecentSpace, ctx),
         KeyBinding::new("ctrl-shift-tab", RecentSpaceBack, ctx),
@@ -88,6 +92,9 @@ pub fn bind_keys(cx: &mut App) {
 }
 
 pub type TabId = u64;
+
+/// How big the log gets before Activity mentions it.
+pub const BIG_LOG: u64 = 100 << 20;
 
 /// A sidebar entry: one or more pages split side by side.
 pub struct Tab {
@@ -180,16 +187,18 @@ pub struct SettingsDialog {
 pub enum SettingsSection {
     Look,
     Tiling,
+    Search,
     AdBlocking,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 3] = [Self::Look, Self::Tiling, Self::AdBlocking];
+    pub const ALL: [Self; 4] = [Self::Look, Self::Tiling, Self::Search, Self::AdBlocking];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Look => "Look",
             Self::Tiling => "Tiling",
+            Self::Search => "Search",
             Self::AdBlocking => "Ad blocking",
         }
     }
@@ -198,6 +207,7 @@ impl SettingsSection {
         match self {
             Self::Look => "icons/palette.svg",
             Self::Tiling => "icons/columns-2.svg",
+            Self::Search => "icons/search.svg",
             Self::AdBlocking => "icons/shield.svg",
         }
     }
@@ -261,6 +271,8 @@ pub struct Workspace {
     pub ink: theme::Ink,
     /// The Settings slider being dragged.
     pub slider_drag: Option<crate::look::Slider>,
+    /// The log's size once past [`BIG_LOG`] (Activity says so).
+    pub big_log: Option<u64>,
     pub focus: FocusHandle,
     _address_events: Subscription,
 }
@@ -309,6 +321,7 @@ impl Workspace {
             thumbs: HashMap::new(),
             ink: theme::Ink::standard(),
             slider_drag: None,
+            big_log: None,
             focus: cx.focus_handle(),
             _address_events: address_events,
         };
@@ -326,6 +339,16 @@ impl Workspace {
                     break;
                 }
                 cx.background_executor().timer(std::time::Duration::from_secs(60 * 60)).await;
+            }
+        })
+        .detach();
+        // Every few minutes: has the log grown big?
+        cx.spawn(async move |this, cx| {
+            loop {
+                if this.update(cx, |ws, cx| ws.check_log(cx)).is_err() {
+                    break;
+                }
+                cx.background_executor().timer(std::time::Duration::from_secs(5 * 60)).await;
             }
         })
         .detach();
@@ -456,14 +479,67 @@ impl Workspace {
         self.tabs.get(self.active)
     }
 
-    /// Where a pane lives: its tab's index.
+    /// Where a pane is shown: its tab's index. A page linked into several
+    /// spaces is in the shown one if there, else the one last looked at.
     pub fn tab_of(&self, pane: PaneId) -> Option<usize> {
-        self.tabs.iter().position(|t| t.root.contains(pane))
+        if self.tabs.get(self.active).is_some_and(|t| t.root.contains(pane)) {
+            return Some(self.active);
+        }
+        let mut spaces = self.spaces_of(pane);
+        spaces.sort_by_key(|&t| self.visit_order(t));
+        spaces.first().copied()
+    }
+
+    /// Where going to a page takes you: the current space if it is there,
+    /// else a space showing it alone, else where it was last seen.
+    pub fn home_of(&self, pane: PaneId) -> Option<usize> {
+        if self.tabs.get(self.active).is_some_and(|t| t.root.contains(pane)) {
+            return Some(self.active);
+        }
+        let mut spaces = self.spaces_of(pane);
+        spaces.sort_by_key(|&t| (!self.is_solo(t), self.visit_order(t)));
+        spaces.first().copied()
+    }
+
+    /// A space holding one page.
+    pub fn is_solo(&self, t: usize) -> bool {
+        matches!(self.tabs[t].root, Node::Pane { .. })
+    }
+
+    /// How long ago a space was visited: 0 for the current one, then
+    /// the one before it; `usize::MAX` for never.
+    pub fn visit_order(&self, t: usize) -> usize {
+        self.recent.iter().position(|&id| id == self.tabs[t].id).unwrap_or(usize::MAX)
+    }
+
+    /// Every space a page is in, in sidebar order (more than one: linked).
+    pub fn spaces_of(&self, pane: PaneId) -> Vec<usize> {
+        (0..self.tabs.len()).filter(|&t| self.tabs[t].root.contains(pane)).collect()
+    }
+
+    /// Closes a page no space holds any more. One still downloading stays
+    /// open, unseen, until its downloads end: the download is the page's
+    /// (a link that opened a window to download closes that window as the
+    /// download starts), and closing the page would end it.
+    pub(crate) fn release(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.tabs.iter().any(|t| t.root.contains(pane)) {
+            return;
+        }
+        if self.downloading(pane) {
+            if let Some(p) = self.panes.get(&pane) {
+                p.view.update(cx, |v, _| v.set_hidden(true));
+            }
+            return;
+        }
+        if let Some(p) = self.panes.remove(&pane) {
+            p.view.update(cx, |v, _| v.close());
+        }
+        self.forget_page_notices(pane, cx);
     }
 
     /// Shows a pane wherever it is: its tab comes to the front, it takes focus.
     pub fn reveal_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.tab_of(pane) else { return };
+        let Some(index) = self.home_of(pane) else { return };
         self.tabs[index].focused = pane;
         self.activate(index, window, cx);
     }
@@ -512,11 +588,13 @@ impl Workspace {
         self.recent.retain(|t| *t != id);
         self.recent.insert(0, id);
         self.recent.truncate(64);
-        // Pages of other tabs stop rendering until shown again.
-        for (i, tab) in self.tabs.iter().enumerate() {
+        // Pages of other tabs stop rendering until shown again (a linked
+        // page shows if this tab has it too).
+        let shown = &self.tabs[index].root;
+        for tab in &self.tabs {
             for pane in tab.root.panes() {
                 if let Some(p) = self.panes.get(&pane) {
-                    p.view.update(cx, |v, _| v.set_hidden(i != index));
+                    p.view.update(cx, |v, _| v.set_hidden(!shown.contains(pane)));
                 }
             }
         }
@@ -566,7 +644,7 @@ impl Workspace {
                     self.space_for(popup, true, window, cx);
                 }
             }
-            WebEvent::CloseRequested => self.close_pane(pane, window, cx),
+            WebEvent::CloseRequested => self.close_page(pane, window, cx),
             WebEvent::Download(download) => self.download_changed(pane, download, cx),
             WebEvent::Notification(note) => self.note_shown(pane, note, window, cx),
             WebEvent::NotificationClosed(id) => self.note_closed(pane, *id, cx),
@@ -751,43 +829,34 @@ impl Workspace {
         self.activate(index, window, cx);
     }
 
-    /// Moves an open page from its space to beside `target` (a space it
-    /// leaves empty goes away).
-    pub fn move_beside(&mut self, pane: PaneId, target: PaneId, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(from), Some(_)) = (self.tab_of(pane), self.tab_of(target)) else { return };
-        if !self.tabs[from].root.remove(pane) {
-            // Its space's only page: the space goes, the page stays.
-            self.tabs.remove(from);
-            if from < self.active {
-                self.active -= 1;
-            }
-        } else {
-            let tab = &mut self.tabs[from];
-            if tab.zoomed == Some(pane) {
-                tab.zoomed = None;
-            }
-            if tab.focused == pane {
-                tab.focused = tab.root.panes()[0];
-            }
-        }
+    /// Shows an open page beside `target` as well: linked, it stays in its
+    /// own space too (the same page, not a copy). From `target`'s own
+    /// space, it moves there instead.
+    pub fn link_beside(&mut self, pane: PaneId, target: PaneId, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.tab_of(target) else { return };
+        if pane == target || !self.panes.contains_key(&pane) {
+            return;
+        }
         let tab = &mut self.tabs[index];
         tab.zoomed = None;
-        tab.root.split(target, edge, pane);
+        if tab.root.contains(pane) {
+            tab.root.move_to(pane, target, edge);
+        } else {
+            tab.root.split(target, edge, pane);
+        }
         tab.focused = pane;
         self.activate(index, window, cx);
     }
 
+    /// Ctrl+W: takes a pane out of the space showing it (or the one it is
+    /// in); the page closes once no space has it.
     pub fn close_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(t) = self.tabs.iter().position(|t| t.root.contains(pane)) else { return };
+        let Some(t) = self.tab_of(pane) else { return };
         if !self.tabs[t].root.remove(pane) {
             // The tab's last pane: the tab goes with it.
             return self.close_tab(t, window, cx);
         }
-        if let Some(p) = self.panes.remove(&pane) {
-            p.view.update(cx, |v, _| v.close());
-        }
-        self.forget_page_notices(pane, cx);
+        self.release(pane, cx);
         let tab = &mut self.tabs[t];
         if tab.zoomed == Some(pane) {
             tab.zoomed = None;
@@ -807,11 +876,9 @@ impl Workspace {
             return;
         }
         let tab = self.tabs.remove(index);
+        // Pages linked into other spaces stay open there.
         for pane in tab.root.panes() {
-            if let Some(p) = self.panes.remove(&pane) {
-                p.view.update(cx, |v, _| v.close());
-            }
-            self.forget_page_notices(pane, cx);
+            self.release(pane, cx);
         }
         if self.tabs.is_empty() {
             // The window empties; the palette asks where to go next.
@@ -819,8 +886,15 @@ impl Workspace {
             self.sync_address(cx);
             return self.open_palette(Intent::NewSpace, window, cx);
         }
-        if index < self.active || self.active >= self.tabs.len() {
-            self.active = self.active.saturating_sub(1);
+        if index == self.active {
+            // The one shown goes: back to the space shown before it (a
+            // window a link opened, closed, goes back to where the link
+            // was), else its neighbor.
+            self.recent.retain(|id| *id != tab.id);
+            let before = self.recent.iter().find_map(|id| self.tabs.iter().position(|t| t.id == *id));
+            self.active = before.unwrap_or(index.min(self.tabs.len() - 1));
+        } else if index < self.active {
+            self.active -= 1;
         }
         self.activate(self.active, window, cx);
     }
@@ -835,6 +909,24 @@ impl Workspace {
             tab.zoomed = None;
             cx.notify();
         }
+    }
+
+    /// The page itself goes (it closed itself): out of every space.
+    pub fn close_page(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        while self.tab_of(pane).is_some() {
+            self.close_pane(pane, window, cx);
+        }
+    }
+
+    /// Takes `pane` out of its space into a new one just below it in the
+    /// list, as dragged to the sidebar there: the space it left stays shown.
+    /// A page linked elsewhere just leaves (it has a space already).
+    pub fn put_away(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tab_of(pane) else { return };
+        if self.spaces_of(pane).len() > 1 {
+            return self.close_pane(pane, window, cx);
+        }
+        self.pane_to_new_space(pane, index + 1, window, cx);
     }
 
     /// Takes `pane` out of its space into a new one at `at` in the list,
@@ -872,15 +964,26 @@ impl Workspace {
         if self.tab_of(target).is_none_or(|t| t == from) {
             return;
         }
-        let moved = self.tabs.remove(from);
+        let mut moved = self.tabs.remove(from);
         if from < self.active {
             self.active -= 1;
         }
         let Some(index) = self.tab_of(target) else { return };
+        // Pages linked into both are there once (the space's last one
+        // already there: nothing comes over).
         let into = &mut self.tabs[index];
+        let mut nothing_left = false;
+        for pane in moved.root.panes() {
+            if into.root.contains(pane) && !moved.root.remove(pane) {
+                nothing_left = true;
+            }
+        }
         into.zoomed = None;
-        into.root.insert(target, edge, moved.root);
-        into.focused = moved.focused;
+        if !nothing_left {
+            let focused = moved.root.contains(moved.focused).then_some(moved.focused);
+            into.root.insert(target, edge, moved.root);
+            into.focused = focused.unwrap_or(into.focused);
+        }
         self.activate(index, window, cx);
     }
 
@@ -908,8 +1011,10 @@ impl Workspace {
     }
 
     pub fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The address lives in the full sidebar.
+        // The address lives in the full sidebar; hidden in Settings, it
+        // shows while focused.
         self.sidebar.collapsed = false;
+        self.address_focused = true;
         let handle = self.address.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         self.address.update(cx, |input, cx| input.select_all_text(cx));
@@ -1025,6 +1130,19 @@ impl Workspace {
             self.open_palette(Intent::Anything, window, cx);
         }
     }
+    pub fn on_put_away_pane(&mut self, _: &PutAwayPane, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.active_tab().map(|t| t.focused) {
+            self.put_away(pane, window, cx);
+        }
+    }
+    /// The focused page's address to the clipboard.
+    pub fn on_copy_address(&mut self, _: &CopyAddress, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(url) = self.focused_view().map(|v| url::display(v.read(cx).url())) else { return };
+        if !url.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+        }
+    }
+
     pub fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(pane) = self.active_tab().map(|t| t.focused) {
             self.close_pane(pane, window, cx);
@@ -1185,6 +1303,27 @@ impl Workspace {
 
     /// Looks for a newer uBlock Origin Lite and downloads it (off the main
     /// thread); the result shows in Settings and, if ready, in Activity.
+    /// Notes the log's size once it passes [`BIG_LOG`].
+    pub fn check_log(&mut self, cx: &mut Context<Self>) {
+        let size = crate::LOG_PATH.get().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len());
+        let big = size.filter(|s| *s > BIG_LOG);
+        if big != self.big_log {
+            self.big_log = big;
+            cx.notify();
+        }
+    }
+
+    /// Empties the log (it carries on from there).
+    pub fn clear_log(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = crate::LOG_PATH.get()
+            && let Err(error) = std::fs::OpenOptions::new().write(true).truncate(true).open(path)
+        {
+            tracing::warn!("clearing {}: {error}", path.display());
+        }
+        tracing::info!("log cleared");
+        self.check_log(cx);
+    }
+
     pub fn check_ublock(&mut self, cx: &mut Context<Self>) {
         let store = &mut self.store;
         let Some(running) = store.ublock_version.clone() else { return };
@@ -1247,6 +1386,7 @@ impl Workspace {
         let Some(index) = self.tab_of(pane) else { return };
         let tab = &mut self.tabs[index];
         tab.zoomed = if tab.zoomed == Some(pane) { None } else { Some(pane) };
+        tracing::debug!("pane {pane} zoomed: {}", tab.zoomed.is_some());
         cx.notify();
     }
 }
